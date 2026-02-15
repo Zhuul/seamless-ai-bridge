@@ -158,79 +158,6 @@ function activate(extensionContext) {
     return emitted;
   }
 
-  async function tryForwardToParticipant(target, routedPrompt, stream, token) {
-    const chatApi = vscode.chat;
-    if (!chatApi || typeof chatApi !== 'object') {
-      log('vscode.chat API is not available for forwarding.');
-      return false;
-    }
-
-    const attempts = [
-      {
-        method: 'sendChatParticipantRequest',
-        argSets: [
-          [target.id, routedPrompt, token],
-          [{ participant: target.id, prompt: routedPrompt }, token],
-          [target.id, { prompt: routedPrompt }, token],
-          [target.id, routedPrompt],
-        ],
-      },
-      {
-        method: 'requestChatParticipant',
-        argSets: [
-          [target.id, routedPrompt, token],
-          [{ participant: target.id, prompt: routedPrompt }, token],
-          [target.id, { prompt: routedPrompt }, token],
-          [target.id, routedPrompt],
-        ],
-      },
-      {
-        method: 'sendRequest',
-        argSets: [
-          [target.id, routedPrompt, token],
-          [{ participant: target.id, prompt: routedPrompt }, token],
-          [target.id, { prompt: routedPrompt }, token],
-          [target.id, routedPrompt],
-        ],
-      },
-      {
-        method: 'request',
-        argSets: [
-          [target.id, routedPrompt, token],
-          [{ participant: target.id, prompt: routedPrompt }, token],
-          [target.id, { prompt: routedPrompt }, token],
-          [target.id, routedPrompt],
-        ],
-      },
-    ];
-
-    for (const attempt of attempts) {
-      const fn = chatApi[attempt.method];
-      if (typeof fn !== 'function') continue;
-
-      for (const args of attempt.argSets) {
-        try {
-          log(`Attempting route via vscode.chat.${attempt.method} to id=${target.id}.`);
-          const result = await fn.apply(chatApi, args);
-          const emitted = await streamForwardResult(result, stream);
-          log(`Routing succeeded via vscode.chat.${attempt.method} to id=${target.id}.`);
-          if (!emitted) {
-            stream.markdown(`Forwarded to @${target.name || target.id}.`);
-          }
-          return true;
-        } catch (error) {
-          const message = error && error.message ? error.message : String(error);
-          log(`Routing attempt failed via ${attempt.method}: ${message}`);
-          log(`   - Error Name: ${error.name}`);
-          log(`   - Error Message: ${error.message}`);
-          log(`   - Error Stack: ${error.stack}`);
-        }
-      }
-    }
-
-    return false;
-  }
-
   let bridgeInstance;
 
   function getBridge() {
@@ -392,7 +319,7 @@ function activate(extensionContext) {
   log('Activating Seamless AI Bridge.');
   refreshParticipantRegistry();
 
-  const participant = vscode.chat.createChatParticipant('seamless-ai-bridge', async (request, _chatContext, stream, token) => {
+  async function handleRequest(request, _chatContext, response, token) {
     const prompt = (request.prompt || '').trim();
 
     if (prompt.startsWith('/exec ')) {
@@ -400,17 +327,17 @@ function activate(extensionContext) {
       const cwd = vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0
         ? vscode.workspace.workspaceFolders[0].uri.fsPath
         : undefined;
-      stream.markdown(`cwd: ${cwd || process.cwd()}`);
-      stream.markdown(`$ ${cmd}`);
+      response.markdown(`cwd: ${cwd || process.cwd()}`);
+      response.markdown(`$ ${cmd}`);
       const { code, stdout, stderr } = await runShell(cmd, cwd, token);
-      if (stdout) stream.markdown(['```', stdout, '```'].join('\n'));
-      if (stderr) stream.markdown(['stderr:', '```', stderr, '```'].join('\n'));
-      if (code !== 0) stream.markdown(`Process exited with code ${code}`);
+      if (stdout) response.markdown(['```', stdout, '```'].join('\n'));
+      if (stderr) response.markdown(['stderr:', '```', stderr, '```'].join('\n'));
+      if (code !== 0) response.markdown(`Process exited with code ${code}`);
       return;
     }
 
     if (!prompt) {
-      stream.markdown('Type a prompt for @bridge.');
+      response.markdown('Type a prompt for @bridge.');
       return;
     }
 
@@ -419,32 +346,48 @@ function activate(extensionContext) {
       const target = findParticipantByNameOrId(routed.targetName);
 
       if (target && target.id !== 'seamless-ai-bridge') {
-        log(`Routing prompt to @${routed.targetName} (id=${target.id}).`);
-        const forwarded = await tryForwardToParticipant(target, routed.routedPrompt, stream, token);
-        if (forwarded) return;
-
-        log(`Failed to forward to id=${target.id}. Falling back to local bridge.`);
-        stream.markdown(`Unable to route to @${routed.targetName}. Routing to local bridge.`);
-        await routeToLocalBridge(routed.routedPrompt, stream, token);
-        return;
+        const forwardedPrompt = routed.routedPrompt || prompt;
+        log(`Routing prompt to @${routed.targetName} (id=${target.id}) via chat.forward.`);
+        try {
+          const forwardedStream = await vscode.commands.executeCommand('chat.forward', {
+            participant: target.id,
+            prompt: forwardedPrompt,
+          });
+          const emitted = await streamForwardResult(forwardedStream, response);
+          if (!emitted) {
+            response.markdown(`Forwarded to @${target.name || target.id}.`);
+          }
+          return;
+        } catch (error) {
+          const message = error && error.message ? error.message : String(error);
+          log(`chat.forward failed for id=${target.id}: ${message}`);
+          log(`   - Error Name: ${error && error.name}`);
+          log(`   - Error Message: ${error && error.message}`);
+          log(`   - Error Stack: ${error && error.stack}`);
+          response.markdown(`Unable to route to @${routed.targetName}. Routing to local bridge.`);
+          await routeToLocalBridge(forwardedPrompt, response, token);
+          return;
+        }
       }
 
       if (!target) {
         log(`Participant @${routed.targetName} was not found. Falling back to local bridge.`);
-        stream.markdown(`Participant @${routed.targetName} not found. Routing to local bridge.`);
-        await routeToLocalBridge(prompt, stream, token);
+        response.markdown(`Participant @${routed.targetName} not found. Routing to local bridge.`);
+        await routeToLocalBridge(prompt, response, token);
         return;
       }
 
       // Target was this bridge itself (for example: @bridge @bridge ...)
       log('Target participant is local bridge. Routing locally.');
-      await routeToLocalBridge(routed.routedPrompt, stream, token);
+      await routeToLocalBridge(routed.routedPrompt, response, token);
       return;
     }
 
     log('No participant specified. Routing to local bridge.');
-    await routeToLocalBridge(prompt, stream, token);
-  });
+    await routeToLocalBridge(prompt, response, token);
+  }
+
+  const participant = vscode.chat.createChatParticipant('seamless-ai-bridge', handleRequest);
 
   extensionContext.subscriptions.push(participant);
   extensionContext.subscriptions.push(new vscode.Disposable(() => {
