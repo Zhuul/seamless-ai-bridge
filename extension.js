@@ -19,7 +19,7 @@ function runShell(command, cwd, token) {
   });
 }
 
-function activate(context) {
+function activate(extensionContext) {
   // Lazy-start bridge process to simulate Codex backend
   let bridgeInstance;
   function getBridge() {
@@ -27,10 +27,10 @@ function activate(context) {
     const cfg = vscode.workspace.getConfiguration();
     const configuredPath = cfg.get('seamlessAiBridge.path');
     const envPath = process.env.CODEX_BRIDGE_PATH || process.env.CODEX_CLI_PATH;
-    const resolved = configuredPath || envPath || path.join(context.extensionUri.fsPath, 'bridge-echo.js');
+    const cliPath = configuredPath || path.join(extensionContext.extensionPath, 'bridge-echo.js');
     // Use fork for Node scripts, spawn otherwise
-    const useFork = resolved.endsWith('.js') && !resolved.endsWith('.mjs');
-    const child = useFork ? cp.fork(resolved, [], { silent: true }) : cp.spawn(resolved, [], { stdio: ['pipe', 'pipe', 'pipe'] });
+    const useFork = cliPath.endsWith('.js') && !cliPath.endsWith('.mjs');
+    const child = useFork ? cp.fork(cliPath, [], { silent: true }) : cp.spawn(cliPath, [], { stdio: ['pipe', 'pipe', 'pipe'] });
     const rl = readline.createInterface({ input: child.stdout, crlfDelay: Infinity });
     const pending = new Map(); // id -> { handler, timeout }
 
@@ -188,8 +188,8 @@ function activate(context) {
     response.markdown('Use /exec to run shell commands, or just type to talk to the bridge. Use /copilot to route messages.');
   });
 
-  context.subscriptions.push(participant);
-  context.subscriptions.push(new vscode.Disposable(() => {
+  extensionContext.subscriptions.push(participant);
+  extensionContext.subscriptions.push(new vscode.Disposable(() => {
     try { if (bridgeInstance) bridgeInstance.dispose(); } catch {}
   }));
 }
