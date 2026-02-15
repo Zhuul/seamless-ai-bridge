@@ -1,7 +1,6 @@
 const vscode = require('vscode');
 const cp = require('child_process');
 const path = require('path');
-const readline = require('readline');
 
 function runShell(command, cwd, token) {
   return new Promise((resolve) => {
@@ -20,95 +19,91 @@ function runShell(command, cwd, token) {
 }
 
 function activate(extensionContext) {
-  // Lazy-start bridge process to simulate Codex backend
   let bridgeInstance;
+
   function getBridge() {
     if (bridgeInstance) return bridgeInstance;
+
     const cfg = vscode.workspace.getConfiguration();
     const configuredPath = cfg.get('seamlessAiBridge.path');
-    const envPath = process.env.CODEX_BRIDGE_PATH || process.env.CODEX_CLI_PATH;
-    const cliPath = configuredPath || path.join(extensionContext.extensionPath, 'bridge-echo.js');
-    // Use fork for Node scripts, spawn otherwise
-    const useFork = cliPath.endsWith('.js') && !cliPath.endsWith('.mjs');
-    const child = useFork ? cp.fork(cliPath, [], { silent: true }) : cp.spawn(cliPath, [], { stdio: ['pipe', 'pipe', 'pipe'] });
-    const rl = readline.createInterface({ input: child.stdout, crlfDelay: Infinity });
-    const pending = new Map(); // id -> { handler, timeout }
+    const envPath = process.env.SEAMLESS_AI_BRIDGE_PATH
+      || process.env.SEAMLESS_AI_CLI_PATH
+      || process.env.CODEX_BRIDGE_PATH
+      || process.env.CODEX_CLI_PATH;
+    const cliPath = configuredPath || envPath || path.join(extensionContext.extensionPath, 'bridge-echo.js');
 
-    function clearPending(id) {
-      const entry = pending.get(id);
-      if (!entry) return;
-      clearTimeout(entry.timeout);
-      pending.delete(id);
-    }
-
-    rl.on('line', (line) => {
-      const raw = (line || '').trim();
-      if (!raw) return;
-      try {
-        const payload = JSON.parse(raw);
-        const id = payload && payload.id;
-        if (id && pending.has(id)) {
-          const { handler } = pending.get(id);
-          try {
-            const done = handler(payload) === true;
-            if (done || payload.type === 'codex_reply') clearPending(id);
-          } catch {
-            clearPending(id);
-          }
-        }
-      } catch {
-        // ignore malformed lines
-      }
-    });
-
-    child.on('error', (err) => {
-      // Best-effort: fail any pending requests
-      for (const [id, entry] of pending) {
-        try { entry.handler({ type: 'error', text: `bridge error: ${err && err.message || String(err)}` }); } catch {}
-        clearPending(id);
-      }
-    });
-
-    child.on('exit', () => {
-      for (const [id, entry] of pending) {
-        try { entry.handler({ type: 'error', text: 'bridge exited' }); } catch {}
-        clearPending(id);
-      }
-    });
+    const running = new Set();
 
     function send(text, handler) {
-      const id = Math.random().toString(36).slice(2);
-      let timeout;
-      if (typeof handler === 'function') {
-        timeout = setTimeout(() => {
-          if (!pending.has(id)) return;
-          const entry = pending.get(id);
-          try { entry.handler({ type: 'timeout', text: 'No response from bridge' }); } catch {}
-          clearPending(id);
-        }, 30000);
-        pending.set(id, { handler, timeout });
-      }
-      const payload = { id, text };
-      try {
-        child.stdin.write(JSON.stringify(payload) + '\n');
-      } catch (e) {
-        if (pending.has(id)) {
-          const entry = pending.get(id);
-          try { entry.handler({ type: 'error', text: String(e && e.message || e) }); } catch {}
-          clearPending(id);
+      const input = String(text || '');
+      const isNodeScript = cliPath.endsWith('.js') || cliPath.endsWith('.mjs') || cliPath.endsWith('.cjs');
+      const child = isNodeScript
+        ? cp.spawn(process.execPath, [cliPath, input], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
+        : cp.spawn(cliPath, [input], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+
+      running.add(child);
+
+      (async () => {
+        try {
+          for await (const chunk of child.stdout) {
+            handler({ type: 'codex_delta', text: chunk.toString() });
+          }
+        } catch (err) {
+          handler({
+            type: 'error',
+            text: `bridge stdout error: ${err && err.message ? err.message : String(err)}`,
+          });
         }
-      }
+      })();
+
+      let stderr = '';
+      (async () => {
+        try {
+          for await (const chunk of child.stderr) {
+            stderr += chunk.toString();
+          }
+        } catch (err) {
+          handler({
+            type: 'error',
+            text: `bridge stderr error: ${err && err.message ? err.message : String(err)}`,
+          });
+        }
+      })();
+
+      child.on('error', (err) => {
+        running.delete(child);
+        handler({
+          type: 'error',
+          text: `bridge error: ${err && err.message ? err.message : String(err)}`,
+        });
+      });
+
+      child.on('close', (code) => {
+        running.delete(child);
+        const errText = stderr.trim();
+        if (code === 0) {
+          if (errText) {
+            handler({ type: 'codex_delta', text: errText });
+          }
+          handler({ type: 'codex_reply', text: '' });
+          return;
+        }
+        handler({ type: 'error', text: errText || `bridge exited with code ${code}` });
+      });
+
       return {
-        id,
-        cancel: () => clearPending(id),
+        cancel: () => {
+          try { child.kill(); } catch {}
+          running.delete(child);
+        },
       };
     }
 
     function dispose() {
-      try { child.stdin.write('/exit\n'); } catch {}
-      try { child.kill(); } catch {}
-      try { rl.close(); } catch {}
-      pending.clear();
+      for (const child of running) {
+        try { child.kill(); } catch {}
+      }
+      running.clear();
     }
 
     bridgeInstance = { send, dispose };
@@ -143,22 +138,21 @@ function activate(extensionContext) {
       return;
     }
 
-    // Default routing: anything not /exec or /copilot goes to the bridge.
     const isCodexPrefixed = prompt.startsWith('/codex ');
     const query = isCodexPrefixed ? prompt.slice(7).trim() : prompt;
     if (query) {
-      response.markdown('Sending to Codex bridge…');
+      response.markdown('Sending to bridge...');
       const bridge = getBridge();
-      const requestHandle = bridge.send(query, (payload) => {
+      const requestHandle = bridge.send(request.prompt || '', (payload) => {
         const kind = (payload && payload.type) || 'message';
         const text = (payload && payload.text) || '';
         if (kind === 'codex_delta') {
           response.markdown(text);
-          return false; // keep streaming
+          return false;
         }
         if (kind === 'codex_reply') {
-          response.markdown(text);
-          return true; // done
+          if (text) response.markdown(text);
+          return true;
         }
         if (kind === 'timeout') {
           response.markdown('Bridge timed out.');
@@ -171,6 +165,7 @@ function activate(extensionContext) {
         response.markdown(`${kind}: ${text}`);
         return false;
       });
+
       if (token) {
         if (token.isCancellationRequested) {
           requestHandle.cancel();
