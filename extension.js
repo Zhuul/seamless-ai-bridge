@@ -102,9 +102,9 @@ function activate(extensionContext) {
     if (!needle) return undefined;
 
     for (const participant of participantRegistry.values()) {
-      if (normalize(participant.name) === needle) return participant;
-      if (normalize(participant.id) === needle) return participant;
-      if (normalize(participant.fullName) === needle) return participant;
+      if (normalize(participant.name).includes(needle)) return participant;
+      if (normalize(participant.id).includes(needle)) return participant;
+      if (normalize(participant.fullName).includes(needle)) return participant;
     }
 
     return undefined;

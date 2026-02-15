@@ -12,6 +12,7 @@
     "vscode": "^1.108.1"
   },
   "activationEvents": [
+    "*",
     "onChatParticipant:seamless-ai-bridge"
   ],
   "categories": [
