@@ -25,7 +25,7 @@ function activate(context) {
   function getBridge() {
     if (bridgeInstance) return bridgeInstance;
     const cfg = vscode.workspace.getConfiguration();
-    const configuredPath = cfg.get('codexBridge.path');
+    const configuredPath = cfg.get('seamlessAiBridge.path');
     const envPath = process.env.CODEX_BRIDGE_PATH || process.env.CODEX_CLI_PATH;
     const resolved = configuredPath || envPath || path.join(context.extensionUri.fsPath, 'bridge-echo.js');
     // Use fork for Node scripts, spawn otherwise

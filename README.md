@@ -1,22 +1,21 @@
+# Seamless AI Bridge
 
-Copilot Codex Bridge
+Seamless AI Bridge is an extensible VS Code chat participant designed to route prompts to custom, self-hosted, and third-party AI models.
 
-A VS Code extension enabling multi-agent collaboration between Copilot and OpenAI Codex. Experiment with plain language or Gibberish Link-style AI prompts to instrument Copilot with Codex as a "slave" agent.
+## Usage
 
-Usage
-Type [CODEX] query in Copilot chat to send queries to Codex
-Explore multi-agent patterns:
+1. Open VS Code Chat.
+2. Mention `@bridge`.
+3. Enter your prompt.
 
-    - Master (Copilot) → Slave (Codex) delegation
-    - Plain text or Gibberish Link prompts for efficiency
-Goal: Improve coding workflows via agent collaboration 🤖
+Example:
 
+```text
+@bridge explain this function and suggest tests
+```
 
-Experimenting
-Test basic [CODEX] command functionality
-Try Gibberish Link-style prompts for optimized interactions
-Contribute to improving multi-agent AI coding patterns!
+## Contributing
 
+Use the project repository for issues, PRs, and discussions:
 
-Contributing
-Check out the https://github.com/Zhuul/copilot-codex-bridge for issues, PRs, or discussions!
+https://github.com/Zhuul/seamless-ai-bridge
