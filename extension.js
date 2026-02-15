@@ -40,20 +40,20 @@ function activate(extensionContext) {
       : cp.spawn(cliPath, [], { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
 
     const rl = readline.createInterface({ input: child.stdout, crlfDelay: Infinity });
-    const pending = new Map(); // id -> { stream, timeout }
+    const pending = new Map(); // id -> { stream, timeout, resolve, reject }
 
-    function clearPending(id) {
+    function takePending(id) {
       const entry = pending.get(id);
-      if (!entry) return;
+      if (!entry) return null;
       clearTimeout(entry.timeout);
       pending.delete(id);
+      return entry;
     }
 
     function failPending(id, message) {
-      const entry = pending.get(id);
+      const entry = takePending(id);
       if (!entry) return;
-      entry.stream.markdown(`Bridge error: ${message}`);
-      clearPending(id);
+      entry.reject(new Error(message));
     }
 
     function failAll(message) {
@@ -93,13 +93,13 @@ function activate(extensionContext) {
 
       if (kind === 'codex_reply') {
         if (text) entry.stream.markdown(text);
-        clearPending(id);
+        const done = takePending(id);
+        if (done) done.resolve();
         return;
       }
 
       if (kind === 'error') {
-        entry.stream.markdown(`Bridge error: ${text || 'unknown error'}`);
-        clearPending(id);
+        failPending(id, text || 'unknown error');
         return;
       }
 
@@ -115,40 +115,38 @@ function activate(extensionContext) {
     });
 
     function send(text, stream, token) {
-      const id = Math.random().toString(36).slice(2);
-      const timeout = setTimeout(() => {
-        if (!pending.has(id)) return;
-        stream.markdown('Bridge timed out.');
-        clearPending(id);
-      }, 30000);
+      return new Promise((resolve, reject) => {
+        const id = Math.random().toString(36).slice(2);
+        const timeout = setTimeout(() => {
+          const entry = takePending(id);
+          if (!entry) return;
+          entry.reject(new Error('Bridge timed out.'));
+        }, 30000);
 
-      pending.set(id, { stream, timeout });
+        pending.set(id, { stream, timeout, resolve, reject });
 
-      const cancel = () => {
-        if (!pending.has(id)) return;
-        clearPending(id);
-      };
+        const cancel = () => {
+          const entry = takePending(id);
+          if (!entry) return;
+          entry.reject(new Error('Cancelled'));
+        };
 
-      if (token) {
-        if (token.isCancellationRequested) {
-          cancel();
-          stream.markdown('Cancelled');
-          return { cancel };
+        if (token) {
+          if (token.isCancellationRequested) {
+            cancel();
+            return;
+          }
+          token.onCancellationRequested(cancel);
         }
 
-        token.onCancellationRequested(() => {
-          cancel();
-          stream.markdown('Cancelled');
-        });
-      }
-
-      try {
-        child.stdin.write(`${JSON.stringify({ id, text })}\n`);
-      } catch (err) {
-        failPending(id, err && err.message ? err.message : String(err));
-      }
-
-      return { cancel };
+        try {
+          child.stdin.write(`${JSON.stringify({ id, text })}\n`);
+        } catch (err) {
+          const entry = takePending(id);
+          if (!entry) return;
+          entry.reject(err instanceof Error ? err : new Error(String(err)));
+        }
+      });
     }
 
     function dispose() {
@@ -161,7 +159,7 @@ function activate(extensionContext) {
     return bridgeInstance;
   }
 
-  const participant = vscode.chat.createChatParticipant('seamless-ai-bridge', async (request, chatContext, stream, token) => {
+  const participant = vscode.chat.createChatParticipant('seamless-ai-bridge', async (request, _chatContext, stream, token) => {
     const prompt = (request.prompt || '').trim();
 
     if (prompt.startsWith('/exec ')) {
@@ -185,7 +183,16 @@ function activate(extensionContext) {
 
     stream.markdown('Sending to bridge...');
     const bridge = getBridge();
-    bridge.send(prompt, stream, token);
+    try {
+      await bridge.send(prompt, stream, token);
+    } catch (error) {
+      const message = error && error.message ? error.message : String(error);
+      if (message === 'Cancelled') {
+        stream.markdown('Cancelled');
+      } else {
+        stream.markdown(`Error: ${message}`);
+      }
+    }
   });
 
   extensionContext.subscriptions.push(participant);
