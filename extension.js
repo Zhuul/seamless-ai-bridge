@@ -221,7 +221,9 @@ function activate(extensionContext) {
         } catch (error) {
           const message = error && error.message ? error.message : String(error);
           log(`Routing attempt failed via ${attempt.method}: ${message}`);
-          log(`Full error object: ${JSON.stringify(error)}`);
+          log(`   - Error Name: ${error.name}`);
+          log(`   - Error Message: ${error.message}`);
+          log(`   - Error Stack: ${error.stack}`);
         }
       }
     }
