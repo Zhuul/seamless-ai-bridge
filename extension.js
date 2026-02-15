@@ -364,6 +364,22 @@ function activate(extensionContext) {
           log(`   - Error Name: ${error && error.name}`);
           log(`   - Error Message: ${error && error.message}`);
           log(`   - Error Stack: ${error && error.stack}`);
+
+          const isChatForwardMissing = normalize(message) === "command 'chat.forward' not found";
+          if (isChatForwardMissing) {
+            log(`chat.forward unavailable. Trying legacy vscode.chat.sendChatRequest for id=${target.id}.`);
+            try {
+              await vscode.chat.sendChatRequest(target.id, forwardedPrompt, {}, response, token);
+              return;
+            } catch (legacyError) {
+              const legacyMessage = legacyError && legacyError.message ? legacyError.message : String(legacyError);
+              log(`legacy sendChatRequest failed for id=${target.id}: ${legacyMessage}`);
+              log(`   - Legacy Error Name: ${legacyError && legacyError.name}`);
+              log(`   - Legacy Error Message: ${legacyError && legacyError.message}`);
+              log(`   - Legacy Error Stack: ${legacyError && legacyError.stack}`);
+            }
+          }
+
           response.markdown(`Unable to route to @${routed.targetName}. Routing to local bridge.`);
           await routeToLocalBridge(forwardedPrompt, response, token);
           return;
