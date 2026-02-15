@@ -1,46 +1,39 @@
 {
   "repository": {
     "type": "git",
-    "url": "https://github.com/Zhuul/copilot-codex-bridge.git"
+    "url": "https://github.com/Zhuul/seamless-ai-bridge.git"
   },
-  "name": "copilot-codex-bridge",
+  "name": "seamless-ai-bridge",
   "publisher": "zhuul",
-  "displayName": "copilot-codex-bridge",
-  "description": "Copilot Codex bridge using JavaScript",
+  "displayName": "Seamless AI Bridge",
+  "description": "An extensible chat participant for VS Code designed to route prompts to various AI models.",
   "version": "0.0.1",
   "engines": {
     "vscode": "^1.108.1"
   },
   "activationEvents": [
-    "onChatParticipant:copilot-codex-bridge",
-    "onCommand:copilot-codex-bridge.codexQuery"
+    "onChatParticipant:seamless-ai-bridge"
   ],
   "categories": [
     "Other"
   ],
   "main": "./extension.js",
   "contributes": {
-    "commands": [
-      {
-        "command": "copilot-codex-bridge.codexQuery",
-        "title": "Query Codex"
-      }
-    ],
     "chatParticipants": [
       {
-        "id": "copilot-codex-bridge",
-        "name": "codex",
-        "fullName": "CODEX Bridge",
-        "description": "Bridge participant for Codex conversations",
+        "id": "seamless-ai-bridge",
+        "name": "bridge",
+        "fullName": "Seamless AI Bridge",
+        "description": "Bridge for connecting custom and self-hosted AI models.",
         "isSticky": true
       }
     ],
     "configuration": {
-      "title": "Copilot Codex Bridge",
+      "title": "Seamless AI Bridge",
       "properties": {
-        "codexBridge.path": {
+        "seamlessAiBridge.path": {
           "type": "string",
-          "markdownDescription": "Absolute path to an external bridge CLI. If empty, the extension uses the bundled `bridge-echo.js`. You can also set the environment variables `CODEX_BRIDGE_PATH` or `CODEX_CLI_PATH`.",
+          "markdownDescription": "Absolute path to an external bridge CLI. If empty, the extension uses the bundled `bridge-echo.js`. You can also set the environment variables `SEAMLESS_AI_BRIDGE_PATH` or `SEAMLESS_AI_CLI_PATH`.",
           "default": ""
         }
       }

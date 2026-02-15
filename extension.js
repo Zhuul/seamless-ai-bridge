@@ -115,7 +115,7 @@ function activate(context) {
     return bridgeInstance;
   }
 
-  const participant = vscode.chat.createChatParticipant('copilot-codex-bridge', async (request, context, response, token) => {
+  const participant = vscode.chat.createChatParticipant('seamless-ai-bridge', async (request, context, response, token) => {
     const prompt = (request.prompt || '').trim();
 
     if (prompt.startsWith('/exec ')) {
