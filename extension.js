@@ -21,6 +21,213 @@ function runShell(command, cwd, token) {
 }
 
 function activate(extensionContext) {
+  const output = vscode.window.createOutputChannel('Seamless AI Bridge');
+  extensionContext.subscriptions.push(output);
+
+  function log(message) {
+    output.appendLine(`[${new Date().toISOString()}] ${message}`);
+  }
+
+  function normalize(value) {
+    return String(value || '').trim().toLowerCase();
+  }
+
+  function extractChunkText(chunk) {
+    if (typeof chunk === 'string') return chunk;
+    if (!chunk || typeof chunk !== 'object') return '';
+    if (typeof chunk.value === 'string') return chunk.value;
+    if (typeof chunk.text === 'string') return chunk.text;
+    if (typeof chunk.markdown === 'string') return chunk.markdown;
+    if (typeof chunk.content === 'string') return chunk.content;
+    if (Array.isArray(chunk.content)) {
+      return chunk.content
+        .map((part) => {
+          if (typeof part === 'string') return part;
+          if (part && typeof part.text === 'string') return part.text;
+          if (part && typeof part.value === 'string') return part.value;
+          return '';
+        })
+        .filter(Boolean)
+        .join('');
+    }
+    return '';
+  }
+
+  function detectParticipants() {
+    const found = [];
+
+    for (const extension of vscode.extensions.all) {
+      const contributed = extension
+        && extension.packageJSON
+        && extension.packageJSON.contributes
+        && extension.packageJSON.contributes.chatParticipants;
+
+      if (!Array.isArray(contributed)) continue;
+
+      for (const participant of contributed) {
+        if (!participant || typeof participant.id !== 'string') continue;
+
+        found.push({
+          id: participant.id,
+          name: typeof participant.name === 'string' ? participant.name : '',
+          fullName: typeof participant.fullName === 'string' ? participant.fullName : '',
+          extensionId: extension.id,
+        });
+      }
+    }
+
+    return found;
+  }
+
+  let participantRegistry = new Map();
+
+  function refreshParticipantRegistry() {
+    participantRegistry = new Map();
+    const discovered = detectParticipants();
+
+    log(`Detected ${discovered.length} chat participant(s):`);
+    for (const participant of discovered) {
+      participantRegistry.set(participant.id, participant);
+      const label = participant.name ? `@${participant.name}` : '(no mention name)';
+      log(`- ${label} id=${participant.id} extension=${participant.extensionId}`);
+    }
+
+    if (discovered.length === 0) {
+      log('- none');
+    }
+  }
+
+  function findParticipantByNameOrId(rawName) {
+    const needle = normalize(rawName);
+    if (!needle) return undefined;
+
+    for (const participant of participantRegistry.values()) {
+      if (normalize(participant.name) === needle) return participant;
+      if (normalize(participant.id) === needle) return participant;
+      if (normalize(participant.fullName) === needle) return participant;
+    }
+
+    return undefined;
+  }
+
+  function parseRoutePrompt(prompt) {
+    const match = /^@([A-Za-z0-9._-]+)\s+([\s\S]+)$/.exec(prompt.trim());
+    if (!match) return undefined;
+
+    const targetName = match[1];
+    const routedPrompt = match[2].trim();
+    if (!routedPrompt) return undefined;
+
+    return { targetName, routedPrompt };
+  }
+
+  async function streamForwardResult(result, stream) {
+    let emitted = false;
+
+    if (typeof result === 'string') {
+      stream.markdown(result);
+      return true;
+    }
+
+    if (!result) return false;
+
+    if (typeof result.text === 'string' && result.text) {
+      stream.markdown(result.text);
+      emitted = true;
+    }
+
+    if (typeof result.markdown === 'string' && result.markdown) {
+      stream.markdown(result.markdown);
+      emitted = true;
+    }
+
+    const asyncStream = result.stream && typeof result.stream[Symbol.asyncIterator] === 'function'
+      ? result.stream
+      : (typeof result[Symbol.asyncIterator] === 'function' ? result : undefined);
+
+    if (asyncStream) {
+      for await (const chunk of asyncStream) {
+        const text = extractChunkText(chunk);
+        if (text) {
+          stream.markdown(text);
+          emitted = true;
+        }
+      }
+    }
+
+    return emitted;
+  }
+
+  async function tryForwardToParticipant(target, routedPrompt, stream, token) {
+    const chatApi = vscode.chat;
+    if (!chatApi || typeof chatApi !== 'object') {
+      log('vscode.chat API is not available for forwarding.');
+      return false;
+    }
+
+    const attempts = [
+      {
+        method: 'sendChatParticipantRequest',
+        argSets: [
+          [target.id, routedPrompt, token],
+          [{ participant: target.id, prompt: routedPrompt }, token],
+          [target.id, { prompt: routedPrompt }, token],
+          [target.id, routedPrompt],
+        ],
+      },
+      {
+        method: 'requestChatParticipant',
+        argSets: [
+          [target.id, routedPrompt, token],
+          [{ participant: target.id, prompt: routedPrompt }, token],
+          [target.id, { prompt: routedPrompt }, token],
+          [target.id, routedPrompt],
+        ],
+      },
+      {
+        method: 'sendRequest',
+        argSets: [
+          [target.id, routedPrompt, token],
+          [{ participant: target.id, prompt: routedPrompt }, token],
+          [target.id, { prompt: routedPrompt }, token],
+          [target.id, routedPrompt],
+        ],
+      },
+      {
+        method: 'request',
+        argSets: [
+          [target.id, routedPrompt, token],
+          [{ participant: target.id, prompt: routedPrompt }, token],
+          [target.id, { prompt: routedPrompt }, token],
+          [target.id, routedPrompt],
+        ],
+      },
+    ];
+
+    for (const attempt of attempts) {
+      const fn = chatApi[attempt.method];
+      if (typeof fn !== 'function') continue;
+
+      for (const args of attempt.argSets) {
+        try {
+          log(`Attempting route via vscode.chat.${attempt.method} to id=${target.id}.`);
+          const result = await fn.apply(chatApi, args);
+          const emitted = await streamForwardResult(result, stream);
+          log(`Routing succeeded via vscode.chat.${attempt.method} to id=${target.id}.`);
+          if (!emitted) {
+            stream.markdown(`Forwarded to @${target.name || target.id}.`);
+          }
+          return true;
+        } catch (error) {
+          const message = error && error.message ? error.message : String(error);
+          log(`Routing attempt failed via ${attempt.method}: ${message}`);
+        }
+      }
+    }
+
+    return false;
+  }
+
   let bridgeInstance;
 
   function getBridge() {
@@ -33,6 +240,8 @@ function activate(extensionContext) {
       || process.env.CODEX_BRIDGE_PATH
       || process.env.CODEX_CLI_PATH;
     const cliPath = configuredPath || envPath || path.join(extensionContext.extensionPath, 'bridge-echo.js');
+
+    log(`Using local bridge path: ${cliPath}`);
 
     const isNodeScript = cliPath.endsWith('.js') || cliPath.endsWith('.mjs') || cliPath.endsWith('.cjs');
     const child = isNodeScript
@@ -107,11 +316,15 @@ function activate(extensionContext) {
     });
 
     child.on('error', (err) => {
-      failAll(err && err.message ? err.message : String(err));
+      const message = err && err.message ? err.message : String(err);
+      log(`Local bridge process error: ${message}`);
+      failAll(message);
     });
 
     child.on('exit', (code, signal) => {
-      failAll(`bridge exited (${signal || code})`);
+      const message = `local bridge exited (${signal || code})`;
+      log(message);
+      failAll(message);
     });
 
     function send(text, stream, token) {
@@ -159,6 +372,23 @@ function activate(extensionContext) {
     return bridgeInstance;
   }
 
+  async function routeToLocalBridge(prompt, stream, token) {
+    const bridge = getBridge();
+    try {
+      await bridge.send(prompt, stream, token);
+    } catch (error) {
+      const message = error && error.message ? error.message : String(error);
+      if (message === 'Cancelled') {
+        stream.markdown('Cancelled');
+      } else {
+        stream.markdown(`Error: ${message}`);
+      }
+    }
+  }
+
+  log('Activating Seamless AI Bridge.');
+  refreshParticipantRegistry();
+
   const participant = vscode.chat.createChatParticipant('seamless-ai-bridge', async (request, _chatContext, stream, token) => {
     const prompt = (request.prompt || '').trim();
 
@@ -181,18 +411,36 @@ function activate(extensionContext) {
       return;
     }
 
-    stream.markdown('Sending to bridge...');
-    const bridge = getBridge();
-    try {
-      await bridge.send(prompt, stream, token);
-    } catch (error) {
-      const message = error && error.message ? error.message : String(error);
-      if (message === 'Cancelled') {
-        stream.markdown('Cancelled');
-      } else {
-        stream.markdown(`Error: ${message}`);
+    const routed = parseRoutePrompt(prompt);
+    if (routed) {
+      const target = findParticipantByNameOrId(routed.targetName);
+
+      if (target && target.id !== 'seamless-ai-bridge') {
+        log(`Routing prompt to @${routed.targetName} (id=${target.id}).`);
+        const forwarded = await tryForwardToParticipant(target, routed.routedPrompt, stream, token);
+        if (forwarded) return;
+
+        log(`Failed to forward to id=${target.id}. Falling back to local bridge.`);
+        stream.markdown(`Unable to route to @${routed.targetName}. Routing to local bridge.`);
+        await routeToLocalBridge(routed.routedPrompt, stream, token);
+        return;
       }
+
+      if (!target) {
+        log(`Participant @${routed.targetName} was not found. Falling back to local bridge.`);
+        stream.markdown(`Participant @${routed.targetName} not found. Routing to local bridge.`);
+        await routeToLocalBridge(prompt, stream, token);
+        return;
+      }
+
+      // Target was this bridge itself (for example: @bridge @bridge ...)
+      log('Target participant is local bridge. Routing locally.');
+      await routeToLocalBridge(routed.routedPrompt, stream, token);
+      return;
     }
+
+    log('No participant specified. Routing to local bridge.');
+    await routeToLocalBridge(prompt, stream, token);
   });
 
   extensionContext.subscriptions.push(participant);
