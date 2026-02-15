@@ -53,46 +53,152 @@ function activate(extensionContext) {
     return '';
   }
 
-  function detectParticipants() {
-    const found = [];
+  function toCommandId(entry) {
+    if (typeof entry === 'string') return entry;
+    if (!entry || typeof entry !== 'object') return '';
+    if (typeof entry.command === 'string') return entry.command;
+    if (typeof entry.id === 'string') return entry.id;
+    return '';
+  }
+
+  function getContributedCommandIds(extension) {
+    const contributes = extension && extension.packageJSON && extension.packageJSON.contributes;
+    const commands = contributes && contributes.commands;
+    if (!Array.isArray(commands)) return [];
+
+    const ids = [];
+    for (const command of commands) {
+      const id = toCommandId(command);
+      if (id) ids.push(id);
+    }
+    return ids;
+  }
+
+  function getParticipantCommandHints(participantContribution) {
+    const hints = new Set();
+    const addHint = (value) => {
+      if (typeof value !== 'string') return;
+      const trimmed = value.trim();
+      if (trimmed) hints.add(trimmed);
+    };
+
+    addHint(participantContribution && participantContribution.command);
+    addHint(participantContribution && participantContribution.defaultCommand);
+
+    const inlineCommands = participantContribution && participantContribution.commands;
+    if (Array.isArray(inlineCommands)) {
+      for (const command of inlineCommands) {
+        addHint(toCommandId(command));
+      }
+    }
+
+    const slashCommands = participantContribution && participantContribution.slashCommands;
+    if (Array.isArray(slashCommands)) {
+      for (const command of slashCommands) {
+        addHint(toCommandId(command));
+      }
+    }
+
+    return Array.from(hints);
+  }
+
+  function pickLinkedCommand(participantRecord, participantContribution, extensionCommandIds) {
+    if (!Array.isArray(extensionCommandIds) || extensionCommandIds.length === 0) return '';
+
+    const hinted = getParticipantCommandHints(participantContribution);
+    for (const hint of hinted) {
+      if (extensionCommandIds.includes(hint)) return hint;
+    }
+
+    const participantId = normalize(participantRecord.id);
+    const shortIdRaw = String(participantRecord.id || '').split('.').pop() || '';
+    const shortId = normalize(shortIdRaw);
+    const participantName = normalize(participantRecord.name);
+    const participantFullName = normalize(participantRecord.fullName);
+
+    let bestCommand = '';
+    let bestScore = 0;
+
+    for (const commandId of extensionCommandIds) {
+      const commandNorm = normalize(commandId);
+      if (!commandNorm) continue;
+
+      let score = 0;
+      if (participantId && commandNorm === participantId) score += 100;
+      if (participantId && commandNorm.includes(participantId)) score += 50;
+      if (shortId && shortId.length >= 3 && commandNorm.includes(shortId)) score += 25;
+      if (participantName && participantName.length >= 3 && commandNorm.includes(participantName)) score += 20;
+      if (participantFullName && participantFullName.length >= 5 && commandNorm.includes(participantFullName)) score += 10;
+
+      if (score > bestScore) {
+        bestScore = score;
+        bestCommand = commandId;
+      }
+    }
+
+    return bestScore > 0 ? bestCommand : '';
+  }
+
+  function detectParticipantsAndCommands() {
+    const participants = [];
+    const participantCommands = new Map();
 
     for (const extension of vscode.extensions.all) {
-      const contributed = extension
+      const contributes = extension
         && extension.packageJSON
-        && extension.packageJSON.contributes
-        && extension.packageJSON.contributes.chatParticipants;
+        && extension.packageJSON.contributes;
+      const contributedParticipants = contributes && contributes.chatParticipants;
+      if (!Array.isArray(contributedParticipants)) continue;
 
-      if (!Array.isArray(contributed)) continue;
+      const extensionCommandIds = getContributedCommandIds(extension);
 
-      for (const participant of contributed) {
+      for (const participant of contributedParticipants) {
         if (!participant || typeof participant.id !== 'string') continue;
 
-        found.push({
+        const record = {
           id: participant.id,
           name: typeof participant.name === 'string' ? participant.name : '',
           fullName: typeof participant.fullName === 'string' ? participant.fullName : '',
           extensionId: extension.id,
-        });
+        };
+
+        participants.push(record);
+
+        const linkedCommand = pickLinkedCommand(record, participant, extensionCommandIds);
+        if (linkedCommand) {
+          participantCommands.set(record.id, linkedCommand);
+        }
       }
     }
 
-    return found;
+    return { participants, participantCommands };
   }
 
   let participantRegistry = new Map();
+  let participantCommandRegistry = new Map();
 
   function refreshParticipantRegistry() {
     participantRegistry = new Map();
-    const discovered = detectParticipants();
+    participantCommandRegistry = new Map();
 
-    log(`Detected ${discovered.length} chat participant(s):`);
-    for (const participant of discovered) {
+    const discovered = detectParticipantsAndCommands();
+
+    log(`Detected ${discovered.participants.length} chat participant(s):`);
+    for (const participant of discovered.participants) {
       participantRegistry.set(participant.id, participant);
       const label = participant.name ? `@${participant.name}` : '(no mention name)';
       log(`- ${label} id=${participant.id} extension=${participant.extensionId}`);
+
+      const linkedCommand = discovered.participantCommands.get(participant.id);
+      if (linkedCommand) {
+        participantCommandRegistry.set(participant.id, linkedCommand);
+        log(`  command=${linkedCommand}`);
+      } else {
+        log('  command=(not found)');
+      }
     }
 
-    if (discovered.length === 0) {
+    if (discovered.participants.length === 0) {
       log('- none');
     }
   }
@@ -347,39 +453,33 @@ function activate(extensionContext) {
 
       if (target && target.id !== 'seamless-ai-bridge') {
         const forwardedPrompt = routed.routedPrompt || prompt;
-        log(`Routing prompt to @${routed.targetName} (id=${target.id}) via chat.forward.`);
+        const commandId = participantCommandRegistry.get(target.id);
+
+        if (!commandId) {
+          log(`No command mapping found for participant id=${target.id}. Falling back to local bridge.`);
+          response.markdown(`No command mapping found for @${routed.targetName}. Routing to local bridge.`);
+          await routeToLocalBridge(forwardedPrompt, response, token);
+          return;
+        }
+
+        log(`Routing prompt to @${routed.targetName} (id=${target.id}) via command ${commandId}.`);
         try {
-          const forwardedStream = await vscode.commands.executeCommand('chat.forward', {
+          const result = await vscode.commands.executeCommand(commandId, {
             participant: target.id,
             prompt: forwardedPrompt,
+            response,
+            stream: response,
+            token,
           });
-          const emitted = await streamForwardResult(forwardedStream, response);
-          if (!emitted) {
-            response.markdown(`Forwarded to @${target.name || target.id}.`);
-          }
+
+          await streamForwardResult(result, response);
           return;
         } catch (error) {
           const message = error && error.message ? error.message : String(error);
-          log(`chat.forward failed for id=${target.id}: ${message}`);
+          log(`Command routing failed for id=${target.id} command=${commandId}: ${message}`);
           log(`   - Error Name: ${error && error.name}`);
           log(`   - Error Message: ${error && error.message}`);
           log(`   - Error Stack: ${error && error.stack}`);
-
-          const isChatForwardMissing = normalize(message) === "command 'chat.forward' not found";
-          if (isChatForwardMissing) {
-            log(`chat.forward unavailable. Trying legacy vscode.chat.sendChatRequest for id=${target.id}.`);
-            try {
-              await vscode.chat.sendChatRequest(target.id, forwardedPrompt, {}, response, token);
-              return;
-            } catch (legacyError) {
-              const legacyMessage = legacyError && legacyError.message ? legacyError.message : String(legacyError);
-              log(`legacy sendChatRequest failed for id=${target.id}: ${legacyMessage}`);
-              log(`   - Legacy Error Name: ${legacyError && legacyError.name}`);
-              log(`   - Legacy Error Message: ${legacyError && legacyError.message}`);
-              log(`   - Legacy Error Stack: ${legacyError && legacyError.stack}`);
-            }
-          }
-
           response.markdown(`Unable to route to @${routed.targetName}. Routing to local bridge.`);
           await routeToLocalBridge(forwardedPrompt, response, token);
           return;
