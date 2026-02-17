@@ -454,12 +454,47 @@ function resolveCommandForParticipant(participant, commandCandidates) {
   };
 }
 
-function resolveParticipantByTarget(participantRegistry, rawTarget) {
+function isGenericCoreTarget(target) {
+  const cleanTarget = String(target || '').replace(/^@/, '').trim();
+  if (!cleanTarget) return false;
+
+  const atom = normalizeAtom(cleanTarget);
+  if (atom === 'copilot' || atom === 'githubcopilot') return true;
+
+  const tokens = tokenize(cleanTarget);
+  if (tokens.length === 0) return false;
+
+  const tokenSet = new Set(tokens);
+  if (tokens.length === 1 && tokenSet.has('copilot')) return true;
+  if (tokens.length <= 2 && tokenSet.has('github') && tokenSet.has('copilot')) return true;
+  return false;
+}
+
+function getParticipantFamilyKey(participantId) {
+  const segments = String(participantId || '')
+    .split(/[.:/_-]+/)
+    .filter(Boolean);
+
+  if (segments.length === 0) return '';
+  if (segments.length === 1) return segments[0];
+  return `${segments[0]}.${segments[1]}`;
+}
+
+function getPrimaryVariantRank(participantId) {
+  return String(participantId || '').endsWith('.default') ? 0 : 1;
+}
+
+
+function resolveParticipantByTarget(participantRegistry, rawTarget, options) {
   const target = String(rawTarget || '').replace(/^@/, '').trim();
   if (!target) return undefined;
 
+  const resolvedOptions = options || {};
+
   const targetAtom = normalizeAtom(target);
   const targetTokens = tokenize(target);
+  const targetFamilyKey = getParticipantFamilyKey(target);
+  const genericCoreTarget = isGenericCoreTarget(target);
 
   const candidates = [];
 
@@ -482,15 +517,82 @@ function resolveParticipantByTarget(participantRegistry, rawTarget) {
     if (tokenMatch) score += 60;
     if (targetTokens.length > 0 && targetTokens.every((token) => aliasTokens.includes(token))) score += 30;
 
-    candidates.push({ participant, score });
+    candidates.push({
+      participant,
+      score,
+      familyKey: getParticipantFamilyKey(participant.id),
+      variantRank: getPrimaryVariantRank(participant.id),
+    });
   }
 
-  candidates.sort((left, right) => {
-    if (right.score !== left.score) return right.score - left.score;
-    return left.participant.id.localeCompare(right.participant.id);
-  });
+  if (genericCoreTarget) {
+    candidates.sort((left, right) => {
+      if (right.score !== left.score) return right.score - left.score;
 
-  return candidates.length > 0 ? candidates[0].participant : undefined;
+      const leftRank = left.variantRank;
+      const rightRank = right.variantRank;
+      if (leftRank !== rightRank) return leftRank - rightRank;
+
+      const leftLength = String(left.participant.id || '').length;
+      const rightLength = String(right.participant.id || '').length;
+      if (leftLength !== rightLength) return leftLength - rightLength;
+
+      return left.participant.id.localeCompare(right.participant.id);
+    });
+  } else {
+    candidates.sort((left, right) => {
+      if (right.score !== left.score) return right.score - left.score;
+      return left.participant.id.localeCompare(right.participant.id);
+    });
+  }
+
+  const debugCandidates = candidates.map((entry) => ({
+    id: entry.participant.id,
+    score: entry.score,
+    rank: entry.variantRank,
+    idLength: String(entry.participant.id || '').length,
+  }));
+
+  if (candidates.length === 0) {
+    if (typeof resolvedOptions.onDebug === 'function') {
+      resolvedOptions.onDebug({
+        targetText: target,
+        targetMode: genericCoreTarget ? 'generic' : 'explicit',
+        candidates: debugCandidates,
+        selectedParticipantId: '',
+      });
+    }
+
+    return undefined;
+  }
+
+  let selected = candidates[0].participant;
+
+  if (genericCoreTarget && selected && !String(selected.id || '').endsWith('.default')) {
+    const selectedFamily = getParticipantFamilyKey(selected.id);
+    const preferredFamily = selectedFamily || targetFamilyKey;
+
+    const familyDefault = candidates.find((entry) => {
+      if (!String(entry.participant.id || '').endsWith('.default')) return false;
+      if (!preferredFamily) return true;
+      return entry.familyKey === preferredFamily;
+    });
+
+    if (familyDefault) {
+      selected = familyDefault.participant;
+    }
+  }
+
+  if (typeof resolvedOptions.onDebug === 'function') {
+    resolvedOptions.onDebug({
+      targetText: target,
+      targetMode: genericCoreTarget ? 'generic' : 'explicit',
+      candidates: debugCandidates,
+      selectedParticipantId: selected ? selected.id : '',
+    });
+  }
+
+  return selected;
 }
 
 function activate(extensionContext) {
@@ -711,13 +813,25 @@ function activate(extensionContext) {
       topCandidates: Array.isArray(topCandidates) ? topCandidates.slice(0, 3) : [],
     });
 
-    let participant = resolveParticipantByTarget(participantRegistry, cleanTarget);
+    let participant = resolveParticipantByTarget(participantRegistry, cleanTarget, {
+      onDebug: (payload) => debugLog({
+        type: 'participant-selection',
+        phase: 'initial',
+        ...payload,
+      }),
+    });
     let retried = false;
 
     if (participant && !participant.linkedCommandId && retryOnMiss) {
       retried = true;
       await refreshParticipantRegistry('miss-retry');
-      participant = resolveParticipantByTarget(participantRegistry, cleanTarget);
+      participant = resolveParticipantByTarget(participantRegistry, cleanTarget, {
+        onDebug: (payload) => debugLog({
+          type: 'participant-selection',
+          phase: 'retry',
+          ...payload,
+        }),
+      });
     }
 
     if (!participant) {

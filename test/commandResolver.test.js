@@ -11,6 +11,25 @@ const {
   resolveParticipantByTarget,
 } = extensionModule.__test;
 
+function buildCopilotRegistry() {
+  const defaultParticipant = buildParticipantRecord({
+    id: 'github.copilot.default',
+    name: 'GitHubCopilot',
+    fullName: 'GitHub Copilot',
+  }, 'GitHub.copilot-chat');
+
+  const replayParticipant = buildParticipantRecord({
+    id: 'github.copilot.chatReplay',
+    name: 'chatReplay',
+    fullName: 'GitHub Copilot Replay',
+  }, 'GitHub.copilot-chat');
+
+  return new Map([
+    [replayParticipant.id, replayParticipant],
+    [defaultParticipant.id, defaultParticipant],
+  ]);
+}
+
 suite('Command Resolver', () => {
   test('alias equivalence normalization', () => {
     const forms = [
@@ -24,14 +43,10 @@ suite('Command Resolver', () => {
     for (const atom of normalized) {
       assert.strictEqual(atom, 'githubcopilot');
     }
+  });
 
-    const participant = buildParticipantRecord({
-      id: 'github.copilot.default',
-      name: 'GitHubCopilot',
-      fullName: 'GitHub Copilot',
-    }, 'GitHub.copilot-chat');
-
-    const registry = new Map([[participant.id, participant]]);
+  test('generic alias resolves to default participant', () => {
+    const registry = buildCopilotRegistry();
 
     const byCopilot = resolveParticipantByTarget(registry, 'copilot');
     const byName = resolveParticipantByTarget(registry, 'GitHubCopilot');
@@ -40,6 +55,46 @@ suite('Command Resolver', () => {
     assert.strictEqual(byCopilot.id, 'github.copilot.default');
     assert.strictEqual(byName.id, 'github.copilot.default');
     assert.strictEqual(byId.id, 'github.copilot.default');
+  });
+
+  test('explicit replay alias resolves to replay participant', () => {
+    const registry = buildCopilotRegistry();
+
+    const resolved = resolveParticipantByTarget(registry, 'replay');
+
+    assert.strictEqual(resolved.id, 'github.copilot.chatReplay');
+  });
+
+  test('tie case chooses default for generic target', () => {
+    const defaultParticipant = buildParticipantRecord({
+      id: 'github.copilot.default',
+      name: 'GitHubCopilot',
+      fullName: 'GitHub Copilot',
+    }, 'GitHub.copilot-chat');
+
+    const replayParticipant = buildParticipantRecord({
+      id: 'github.copilot.chatReplay',
+      name: 'GitHubCopilot',
+      fullName: 'GitHub Copilot',
+    }, 'GitHub.copilot-chat');
+
+    const registry = new Map([
+      [replayParticipant.id, replayParticipant],
+      [defaultParticipant.id, defaultParticipant],
+    ]);
+
+    const resolved = resolveParticipantByTarget(registry, 'copilot');
+
+    assert.strictEqual(resolved.id, 'github.copilot.default');
+  });
+
+  test('deterministic sort stability across repeated runs', () => {
+    const registry = buildCopilotRegistry();
+
+    for (let i = 0; i < 50; i += 1) {
+      const resolved = resolveParticipantByTarget(registry, 'github.copilot');
+      assert.strictEqual(resolved.id, 'github.copilot.default');
+    }
   });
 
   test('hint ID precedence', () => {
