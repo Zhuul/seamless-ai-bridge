@@ -36,6 +36,11 @@
           "type": "string",
           "markdownDescription": "Absolute path to an external bridge CLI. If empty, the extension uses the bundled `bridge-echo.js`. You can also set the environment variables `SEAMLESS_AI_BRIDGE_PATH` or `SEAMLESS_AI_CLI_PATH`.",
           "default": ""
+        },
+        "seamlessAiBridge.experimental.enableCrossParticipantChat": {
+          "type": "boolean",
+          "markdownDescription": "Experimental and unstable. When enabled, @bridge may attempt best-effort cross-participant command invocation before automatically falling back to the local bridge provider.",
+          "default": false
         }
       }
     }

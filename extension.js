@@ -2,6 +2,8 @@ const vscode = require('vscode');
 const cp = require('child_process');
 const path = require('path');
 const readline = require('readline');
+const plannerProvider = require('./plannerProvider');
+const coderProvider = require('./coderProvider');
 
 function runShell(command, cwd, token) {
   return new Promise((resolve) => {
@@ -264,13 +266,31 @@ function activate(extensionContext) {
     return emitted;
   }
 
+  function createTrackedResponse(response) {
+    let markdownCount = 0;
+
+    const proxy = Object.create(response);
+    if (typeof response.markdown === 'function') {
+      const originalMarkdown = response.markdown.bind(response);
+      proxy.markdown = (...args) => {
+        markdownCount += 1;
+        return originalMarkdown(...args);
+      };
+    }
+
+    return {
+      response: proxy,
+      getCount: () => markdownCount,
+    };
+  }
+
   let bridgeInstance;
 
   function getBridge() {
     if (bridgeInstance) return bridgeInstance;
 
-    const cfg = vscode.workspace.getConfiguration();
-    const configuredPath = cfg.get('seamlessAiBridge.path');
+    const bridgeConfig = vscode.workspace.getConfiguration('seamlessAiBridge');
+    const configuredPath = bridgeConfig.get('path');
     const envPath = process.env.SEAMLESS_AI_BRIDGE_PATH
       || process.env.SEAMLESS_AI_CLI_PATH
       || process.env.CODEX_BRIDGE_PATH
@@ -285,12 +305,15 @@ function activate(extensionContext) {
       : cp.spawn(cliPath, [], { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
 
     const rl = readline.createInterface({ input: child.stdout, crlfDelay: Infinity });
-    const pending = new Map(); // id -> { stream, timeout, resolve, reject }
+    const pending = new Map(); // id -> { stream, timeout, resolve, reject, cancelDisposable }
 
     function takePending(id) {
       const entry = pending.get(id);
       if (!entry) return null;
       clearTimeout(entry.timeout);
+      if (entry.cancelDisposable && typeof entry.cancelDisposable.dispose === 'function') {
+        entry.cancelDisposable.dispose();
+      }
       pending.delete(id);
       return entry;
     }
@@ -372,20 +395,32 @@ function activate(extensionContext) {
           entry.reject(new Error('Bridge timed out.'));
         }, 30000);
 
-        pending.set(id, { stream, timeout, resolve, reject });
-
-        const cancel = () => {
-          const entry = takePending(id);
-          if (!entry) return;
-          entry.reject(new Error('Cancelled'));
-        };
+        pending.set(id, {
+          stream,
+          timeout,
+          resolve,
+          reject,
+          cancelDisposable: undefined,
+        });
 
         if (token) {
           if (token.isCancellationRequested) {
-            cancel();
+            const entry = takePending(id);
+            if (entry) entry.reject(new Error('Cancelled'));
             return;
           }
-          token.onCancellationRequested(cancel);
+
+          const cancelDisposable = token.onCancellationRequested(() => {
+            const entry = takePending(id);
+            if (entry) entry.reject(new Error('Cancelled'));
+          });
+
+          const entry = pending.get(id);
+          if (entry) {
+            entry.cancelDisposable = cancelDisposable;
+          } else if (cancelDisposable && typeof cancelDisposable.dispose === 'function') {
+            cancelDisposable.dispose();
+          }
         }
 
         try {
@@ -447,60 +482,54 @@ function activate(extensionContext) {
       return;
     }
 
-    const routed = parseRoutePrompt(prompt);
-    if (routed) {
-      const target = findParticipantByNameOrId(routed.targetName);
+    const bridgeConfig = vscode.workspace.getConfiguration('seamlessAiBridge');
+    const isExperimentalMode = Boolean(bridgeConfig.get('experimental.enableCrossParticipantChat', false));
 
-      if (target && target.id !== 'seamless-ai-bridge') {
-        const forwardedPrompt = routed.routedPrompt || prompt;
-        const commandId = participantCommandRegistry.get(target.id);
+    if (isExperimentalMode) {
+      refreshParticipantRegistry();
+    }
 
-        if (!commandId) {
-          log(`No command mapping found for participant id=${target.id}. Falling back to local bridge.`);
-          response.markdown(`No command mapping found for @${routed.targetName}. Routing to local bridge.`);
-          await routeToLocalBridge(forwardedPrompt, response, token);
-          return;
-        }
+    const tracked = createTrackedResponse(response);
+    const providerContext = {
+      userPrompt: prompt,
+    };
 
-        log(`Routing prompt to @${routed.targetName} (id=${target.id}) via command ${commandId}.`);
-        try {
-          const result = await vscode.commands.executeCommand(commandId, {
-            participant: target.id,
-            prompt: forwardedPrompt,
-            response,
-            stream: response,
-            token,
-          });
+    const providerOptions = {
+      isExperimentalMode,
+      response: tracked.response,
+      token,
+      experimentalTimeoutMs: 12000,
+      helpers: {
+        log,
+        parseRoutePrompt,
+        findParticipantByNameOrId,
+        getParticipantCommandById: (id) => participantCommandRegistry.get(id),
+        routeToLocalBridge,
+        streamForwardResult,
+        executeCommand: (commandId, args) => vscode.commands.executeCommand(commandId, args),
+        getResponseCount: tracked.getCount,
+        bridgeParticipantId: 'seamless-ai-bridge',
+      },
+    };
 
-          await streamForwardResult(result, response);
-          return;
-        } catch (error) {
-          const message = error && error.message ? error.message : String(error);
-          log(`Command routing failed for id=${target.id} command=${commandId}: ${message}`);
-          log(`   - Error Name: ${error && error.name}`);
-          log(`   - Error Message: ${error && error.message}`);
-          log(`   - Error Stack: ${error && error.stack}`);
-          response.markdown(`Unable to route to @${routed.targetName}. Routing to local bridge.`);
-          await routeToLocalBridge(forwardedPrompt, response, token);
-          return;
-        }
-      }
-
-      if (!target) {
-        log(`Participant @${routed.targetName} was not found. Falling back to local bridge.`);
-        response.markdown(`Participant @${routed.targetName} not found. Routing to local bridge.`);
-        await routeToLocalBridge(prompt, response, token);
+    try {
+      const planText = await plannerProvider.getPlan(prompt, providerContext, providerOptions);
+      await coderProvider.getCode(planText, providerContext, providerOptions);
+    } catch (error) {
+      const message = error && error.message ? error.message : String(error);
+      if (message === 'Cancelled') {
+        response.markdown('Cancelled');
         return;
       }
 
-      // Target was this bridge itself (for example: @bridge @bridge ...)
-      log('Target participant is local bridge. Routing locally.');
-      await routeToLocalBridge(routed.routedPrompt, response, token);
-      return;
-    }
+      log(`Provider orchestration failed: ${message}`);
+      log(`   - Error Name: ${error && error.name}`);
+      log(`   - Error Message: ${error && error.message}`);
+      log(`   - Error Stack: ${error && error.stack}`);
 
-    log('No participant specified. Routing to local bridge.');
-    await routeToLocalBridge(prompt, response, token);
+      response.markdown('Routing to local bridge due to provider error.');
+      await routeToLocalBridge(prompt, response, token);
+    }
   }
 
   const participant = vscode.chat.createChatParticipant('seamless-ai-bridge', handleRequest);
