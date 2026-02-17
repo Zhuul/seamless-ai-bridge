@@ -46,7 +46,7 @@
     }
   },
   "scripts": {
-    "lint": "eslint .",
+    "lint": "node --max-old-space-size=4096 ./node_modules/.bin/eslint .",
     "pretest": "npm run lint",
     "test": "vscode-test"
   },
