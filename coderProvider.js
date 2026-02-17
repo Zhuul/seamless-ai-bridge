@@ -85,6 +85,24 @@ function safeLog(log, message) {
   }
 }
 
+function shortFallbackMessage(plan) {
+  if (!plan || typeof plan !== 'object') return '';
+
+  if (plan.reason === 'participant-not-found' && plan.targetName) {
+    return `Participant @${plan.targetName} not found. Routing to local bridge.`;
+  }
+
+  if (plan.reason === 'no-command-mapping' && plan.targetName) {
+    return `No command mapping found for @${plan.targetName}. Routing to local bridge.`;
+  }
+
+  if (plan.reason === 'experimental-disabled') {
+    return '';
+  }
+
+  return '';
+}
+
 async function getCode(planText, context, options) {
   const safeContext = context || {};
   const safeOptions = options || {};
@@ -110,6 +128,7 @@ async function getCode(planText, context, options) {
     ? helpers.getResponseCount
     : (() => 0);
   const log = helpers.log;
+  const debugLog = typeof helpers.debugLog === 'function' ? helpers.debugLog : undefined;
 
   if (token && token.isCancellationRequested) {
     throw new Error('Cancelled');
@@ -120,10 +139,18 @@ async function getCode(planText, context, options) {
   }
 
   if (!isExperimentalMode || plan.mode !== 'experimental') {
-    if (plan.reason === 'participant-not-found') {
-      writeMarkdown(response, `Participant @${plan.targetName} not found. Routing to local bridge.`);
-    } else if (plan.reason === 'no-command-mapping') {
-      writeMarkdown(response, `No command mapping found for @${plan.targetName}. Routing to local bridge.`);
+    const message = shortFallbackMessage(plan);
+    if (message) {
+      writeMarkdown(response, message);
+    }
+
+    if (plan.reason === 'no-command-mapping' && plan.diagnostics) {
+      if (debugLog) {
+        debugLog({
+          type: 'no-command-mapping',
+          diagnostics: plan.diagnostics,
+        });
+      }
     }
 
     await routeToLocalBridge(prompt, response, token);
@@ -165,9 +192,6 @@ async function getCode(planText, context, options) {
 
     const message = error && error.message ? error.message : String(error);
     safeLog(log, `Experimental provider failed for id=${plan.targetId} command=${plan.commandId}: ${message}`);
-    safeLog(log, `   - Error Name: ${error && error.name}`);
-    safeLog(log, `   - Error Message: ${error && error.message}`);
-    safeLog(log, `   - Error Stack: ${error && error.stack}`);
 
     if (plan.targetName) {
       writeMarkdown(response, `Unable to route to @${plan.targetName}. Routing to local bridge.`);

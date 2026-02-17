@@ -32,35 +32,89 @@ function createCancellationTokenSource() {
 }
 
 suite('Provider Layer', () => {
-  test('planner selects provider path by experimental flag', async () => {
-    const baseHelpers = {
-      parseRoutePrompt: () => ({ targetName: 'copilot', routedPrompt: 'hello world' }),
-      findParticipantByNameOrId: () => ({ id: 'github.copilot.default', name: 'copilot' }),
-      getParticipantCommandById: () => 'github.copilot.chat.ask',
-      bridgeParticipantId: 'seamless-ai-bridge',
-    };
+  test('planner refresh-on-miss then success', async () => {
+    const calls = [];
 
-    const stablePlanText = await plannerProvider.getPlan('ignored', {}, {
-      isExperimentalMode: false,
-      response: { markdown() {} },
-      token: undefined,
-      helpers: baseHelpers,
-    });
-
-    const stablePlan = JSON.parse(stablePlanText);
-    assert.strictEqual(stablePlan.mode, 'stable');
-    assert.strictEqual(stablePlan.reason, 'experimental-disabled');
-
-    const experimentalPlanText = await plannerProvider.getPlan('ignored', {}, {
+    const planText = await plannerProvider.getPlan('@copilot create a rest api', {}, {
       isExperimentalMode: true,
       response: { markdown() {} },
       token: undefined,
-      helpers: baseHelpers,
+      helpers: {
+        parseRoutePrompt: (prompt) => {
+          const match = /^@([^\s]+)\s+([\s\S]+)$/.exec(prompt.trim());
+          if (!match) return undefined;
+          return { targetName: match[1], routedPrompt: match[2].trim() };
+        },
+        resolveRouteTarget: async (targetName, options) => {
+          calls.push({ targetName, options });
+          return {
+            participant: { id: 'github.copilot.default', name: 'GitHubCopilot' },
+            commandId: 'github.copilot.chat.ask',
+            linkScore: 88,
+            linkReason: 'weighted',
+            retried: true,
+            diagnostics: {
+              target: 'copilot',
+              aliasAtoms: ['copilot', 'githubcopilot'],
+              candidateCount: 24,
+              topCandidates: [{ id: 'github.copilot.chat.ask', score: 88 }],
+            },
+          };
+        },
+        bridgeParticipantId: 'seamless-ai-bridge',
+      },
     });
 
-    const experimentalPlan = JSON.parse(experimentalPlanText);
-    assert.strictEqual(experimentalPlan.mode, 'experimental');
-    assert.strictEqual(experimentalPlan.commandId, 'github.copilot.chat.ask');
+    assert.strictEqual(calls.length, 1);
+    assert.strictEqual(calls[0].targetName, 'copilot');
+    assert.strictEqual(calls[0].options.retryOnMiss, true);
+
+    const plan = JSON.parse(planText);
+    assert.strictEqual(plan.mode, 'experimental');
+    assert.strictEqual(plan.commandId, 'github.copilot.chat.ask');
+    assert.strictEqual(plan.retryAttempted, true);
+  });
+
+  test('planner refresh-on-miss then fallback with diagnostics', async () => {
+    const planText = await plannerProvider.getPlan('@copilot explain this project', {}, {
+      isExperimentalMode: true,
+      response: { markdown() {} },
+      token: undefined,
+      helpers: {
+        parseRoutePrompt: (prompt) => {
+          const match = /^@([^\s]+)\s+([\s\S]+)$/.exec(prompt.trim());
+          if (!match) return undefined;
+          return { targetName: match[1], routedPrompt: match[2].trim() };
+        },
+        resolveRouteTarget: async () => ({
+          participant: { id: 'github.copilot.default', name: 'GitHubCopilot' },
+          commandId: '',
+          linkScore: 0,
+          linkReason: 'none',
+          retried: true,
+          diagnostics: {
+            target: 'copilot',
+            aliasAtoms: ['copilot', 'githubcopilot'],
+            candidateCount: 31,
+            topCandidates: [
+              { id: 'github.copilot.chat.foo', score: 38 },
+              { id: 'github.copilot.chat.bar', score: 34 },
+              { id: 'github.copilot.debug.sample', score: 12 },
+            ],
+          },
+        }),
+        bridgeParticipantId: 'seamless-ai-bridge',
+      },
+    });
+
+    const plan = JSON.parse(planText);
+    assert.strictEqual(plan.mode, 'stable');
+    assert.strictEqual(plan.reason, 'no-command-mapping');
+    assert.strictEqual(plan.retryAttempted, true);
+    assert.strictEqual(plan.diagnostics.target, 'copilot');
+    assert.deepStrictEqual(plan.diagnostics.aliasAtoms, ['copilot', 'githubcopilot']);
+    assert.strictEqual(plan.diagnostics.candidateCount, 31);
+    assert.strictEqual(plan.diagnostics.topCandidates.length, 3);
   });
 
   test('coder falls back to stable provider when experimental command fails', async () => {
@@ -90,6 +144,7 @@ suite('Provider Layer', () => {
       },
       helpers: {
         log() {},
+        debugLog() {},
         getResponseCount: () => writes.length,
         executeCommand: async () => {
           throw new Error('command failed');
@@ -127,6 +182,7 @@ suite('Provider Layer', () => {
       experimentalTimeoutMs: 5000,
       helpers: {
         log() {},
+        debugLog() {},
         getResponseCount: () => 0,
         executeCommand: () => new Promise(() => {}),
         streamForwardResult: async () => false,

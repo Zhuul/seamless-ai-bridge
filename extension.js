@@ -5,6 +5,9 @@ const readline = require('readline');
 const plannerProvider = require('./plannerProvider');
 const coderProvider = require('./coderProvider');
 
+const BLACKLIST_TOKENS = new Set(['test', 'debug', 'internal', 'sample']);
+const CORE_CHAT_TOKENS = new Set(['copilot', 'codex']);
+
 function runShell(command, cwd, token) {
   return new Promise((resolve) => {
     const child = cp.exec(command, { cwd, shell: true, windowsHide: true }, (error, stdout, stderr) => {
@@ -22,6 +25,474 @@ function runShell(command, cwd, token) {
   });
 }
 
+function normalizeAtom(value) {
+  const text = String(value || '')
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase();
+
+  return text.replace(/[^a-z0-9]+/g, '');
+}
+
+function tokenize(value) {
+  const input = String(value || '')
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^A-Za-z0-9]+/g, ' ')
+    .toLowerCase();
+
+  const tokens = input.match(/[a-z0-9]+/g) || [];
+  return tokens.filter((token) => token.length >= 2);
+}
+
+function unique(items) {
+  return Array.from(new Set(items));
+}
+
+function tokenOverlapRatio(referenceTokens, candidateTokens) {
+  const reference = unique(referenceTokens || []);
+  const candidate = new Set(unique(candidateTokens || []));
+  if (reference.length === 0) return 0;
+
+  let overlap = 0;
+  for (const token of reference) {
+    if (candidate.has(token)) overlap += 1;
+  }
+
+  return overlap / reference.length;
+}
+
+function containsOrderedTokenSequence(haystackTokens, needleTokens) {
+  const haystack = haystackTokens || [];
+  const needle = needleTokens || [];
+  if (needle.length === 0) return false;
+
+  let position = 0;
+  for (const token of haystack) {
+    if (token === needle[position]) {
+      position += 1;
+      if (position === needle.length) return true;
+    }
+  }
+
+  return false;
+}
+
+function toCommandId(entry) {
+  if (typeof entry === 'string') return entry;
+  if (!entry || typeof entry !== 'object') return '';
+  if (typeof entry.command === 'string') return entry.command;
+  if (typeof entry.id === 'string') return entry.id;
+  return '';
+}
+
+function getParticipantCommandHints(participantContribution) {
+  const hints = new Set();
+  const slashNames = [];
+
+  const addHint = (value) => {
+    if (typeof value !== 'string') return;
+    const trimmed = value.trim();
+    if (trimmed) hints.add(trimmed);
+  };
+
+  const addSlashName = (value) => {
+    if (typeof value !== 'string') return;
+    const trimmed = value.trim();
+    if (trimmed) slashNames.push(trimmed);
+  };
+
+  addHint(participantContribution && participantContribution.command);
+  addHint(participantContribution && participantContribution.defaultCommand);
+
+  const inlineCommands = participantContribution && participantContribution.commands;
+  if (Array.isArray(inlineCommands)) {
+    for (const command of inlineCommands) {
+      addHint(toCommandId(command));
+      if (command && typeof command.name === 'string') {
+        addSlashName(command.name);
+      }
+    }
+  }
+
+  const slashCommands = participantContribution && participantContribution.slashCommands;
+  if (Array.isArray(slashCommands)) {
+    for (const command of slashCommands) {
+      addHint(toCommandId(command));
+      if (typeof command === 'string') {
+        addSlashName(command);
+      } else if (command && typeof command.name === 'string') {
+        addSlashName(command.name);
+      }
+    }
+  }
+
+  return {
+    hints: Array.from(hints),
+    slashNames: unique(slashNames),
+  };
+}
+
+function buildAliasSet(participant) {
+  const raw = new Set();
+  const atoms = new Set();
+  const tokens = new Set();
+
+  function addAlias(value) {
+    if (typeof value !== 'string') return;
+    const trimmed = value.trim();
+    if (!trimmed) return;
+
+    raw.add(trimmed);
+
+    const atom = normalizeAtom(trimmed);
+    if (atom) {
+      atoms.add(atom);
+      raw.add(atom);
+    }
+
+    for (const token of tokenize(trimmed)) {
+      tokens.add(token);
+    }
+  }
+
+  addAlias(participant.id);
+  addAlias(participant.name);
+  addAlias(participant.fullName);
+
+  const slashNames = Array.isArray(participant.slashCommandNames)
+    ? participant.slashCommandNames
+    : [];
+  for (const slashName of slashNames) {
+    addAlias(slashName);
+  }
+
+  const idSegments = String(participant.id || '')
+    .split(/[.:/_-]+/)
+    .filter(Boolean);
+
+  for (const segment of idSegments) {
+    addAlias(segment);
+  }
+
+  if (idSegments.length >= 2) {
+    addAlias(`${idSegments[0]}.${idSegments[1]}`);
+    addAlias(idSegments.slice(1).join('.'));
+    addAlias(idSegments[1]);
+  }
+
+  if (idSegments.length >= 3) {
+    addAlias(idSegments[2]);
+  }
+
+  const nameTokenJoin = tokenize(participant.name).join('');
+  const fullNameTokenJoin = tokenize(participant.fullName).join('');
+  if (nameTokenJoin) addAlias(nameTokenJoin);
+  if (fullNameTokenJoin) addAlias(fullNameTokenJoin);
+
+  if (tokens.has('github') && tokens.has('copilot')) {
+    addAlias('copilot');
+    addAlias('githubcopilot');
+    addAlias('github.copilot');
+  }
+
+  return {
+    raw: Array.from(raw).sort(),
+    atoms: Array.from(atoms).sort(),
+    tokens: Array.from(tokens).sort(),
+  };
+}
+
+function deriveOrderedTokens(participant) {
+  const idTokens = tokenize(participant.id);
+  if (idTokens.length >= 2) return idTokens.slice(0, 3);
+
+  const nameTokens = tokenize(participant.fullName || participant.name);
+  if (nameTokens.length > 0) return nameTokens.slice(0, 3);
+
+  return [];
+}
+
+function deriveScoringTokens(participant) {
+  const idTokens = tokenize(participant.id);
+  if (idTokens.length >= 2) return unique(idTokens.slice(0, 3));
+
+  const nameTokens = tokenize(participant.name);
+  if (nameTokens.length > 0) return unique(nameTokens.slice(0, 3));
+
+  return [];
+}
+
+function buildParticipantRecord(participantContribution, extensionId) {
+  const { hints, slashNames } = getParticipantCommandHints(participantContribution);
+
+  const participant = {
+    id: participantContribution.id,
+    name: typeof participantContribution.name === 'string' ? participantContribution.name : '',
+    fullName: typeof participantContribution.fullName === 'string' ? participantContribution.fullName : '',
+    extensionId,
+    commandHints: hints,
+    slashCommandNames: slashNames,
+    aliases: { raw: [], atoms: [], tokens: [] },
+    orderedTokens: [],
+    scoringTokens: [],
+    coreToken: '',
+    linkedCommandId: '',
+    linkScore: 0,
+    linkReason: 'none',
+    linkCandidatesTop3: [],
+  };
+
+  participant.aliases = buildAliasSet(participant);
+  participant.orderedTokens = deriveOrderedTokens(participant);
+  participant.scoringTokens = deriveScoringTokens(participant);
+
+  const aliasTokenSet = new Set(participant.aliases.tokens);
+  for (const token of CORE_CHAT_TOKENS) {
+    if (aliasTokenSet.has(token)) {
+      participant.coreToken = token;
+      break;
+    }
+  }
+
+  return participant;
+}
+
+function buildCommandCandidate(commandId, title, category, source) {
+  const id = String(commandId || '').trim();
+  if (!id) return undefined;
+
+  const titleText = typeof title === 'string' ? title : '';
+  const categoryText = typeof category === 'string' ? category : '';
+
+  const idTokens = tokenize(id);
+  const titleTokens = tokenize(titleText);
+  const categoryTokens = tokenize(categoryText);
+  const tokens = unique([...idTokens, ...titleTokens, ...categoryTokens]);
+
+  return {
+    id,
+    title: titleText,
+    category: categoryText,
+    tokens,
+    idTokens,
+    titleTokens,
+    categoryTokens,
+    normalizedIdAtom: normalizeAtom(id),
+    source,
+  };
+}
+
+function buildContributedCommandCatalog(extensions) {
+  const catalog = new Map();
+
+  for (const extension of extensions) {
+    const contributes = extension && extension.packageJSON && extension.packageJSON.contributes;
+    const commands = contributes && contributes.commands;
+    if (!Array.isArray(commands)) continue;
+
+    for (const command of commands) {
+      const commandId = toCommandId(command);
+      const candidate = buildCommandCandidate(
+        commandId,
+        command && typeof command.title === 'string' ? command.title : '',
+        command && typeof command.category === 'string' ? command.category : '',
+        'contributed',
+      );
+
+      if (!candidate) continue;
+
+      if (!catalog.has(candidate.id)) {
+        catalog.set(candidate.id, candidate);
+        continue;
+      }
+
+      const existing = catalog.get(candidate.id);
+      catalog.set(candidate.id, {
+        ...existing,
+        source: 'contributed',
+        title: existing.title || candidate.title,
+        category: existing.category || candidate.category,
+        titleTokens: existing.titleTokens.length ? existing.titleTokens : candidate.titleTokens,
+        categoryTokens: existing.categoryTokens.length ? existing.categoryTokens : candidate.categoryTokens,
+        tokens: unique([...existing.tokens, ...candidate.tokens]),
+      });
+    }
+  }
+
+  return catalog;
+}
+
+function mergeRuntimeCommandCatalog(contributedCatalog, runtimeCommandIds) {
+  const catalog = new Map(contributedCatalog);
+
+  for (const commandId of runtimeCommandIds || []) {
+    const id = String(commandId || '').trim();
+    if (!id) continue;
+
+    if (catalog.has(id)) continue;
+
+    const runtimeCandidate = buildCommandCandidate(id, '', '', 'runtime');
+    if (runtimeCandidate) {
+      catalog.set(id, runtimeCandidate);
+    }
+  }
+
+  return Array.from(catalog.values()).sort((left, right) => left.id.localeCompare(right.id));
+}
+
+function scoreCommandCandidate(participant, candidate) {
+  const hintSet = new Set(participant.commandHints || []);
+  const aliasAtomSet = new Set((participant.aliases && participant.aliases.atoms) || []);
+  const aliasTokenSet = new Set((participant.aliases && participant.aliases.tokens) || []);
+
+  let score = 0;
+
+  if (hintSet.has(candidate.id)) score += 120;
+  if (aliasAtomSet.has(candidate.normalizedIdAtom)) score += 90;
+
+  if (containsOrderedTokenSequence(candidate.idTokens, participant.orderedTokens || [])) {
+    score += 70;
+  }
+
+  if (tokenOverlapRatio(participant.scoringTokens || [], candidate.idTokens || []) >= 0.6) {
+    score += 45;
+  }
+
+  if (tokenOverlapRatio(participant.scoringTokens || [], candidate.titleTokens || []) >= 0.6) {
+    score += 30;
+  }
+
+  if (tokenOverlapRatio(participant.scoringTokens || [], candidate.categoryTokens || []) >= 0.6) {
+    score += 20;
+  }
+
+  if (candidate.source === 'contributed') {
+    score += 15;
+  }
+
+  let blacklistHit = false;
+  for (const token of BLACKLIST_TOKENS) {
+    if (candidate.tokens.includes(token) && !aliasTokenSet.has(token)) {
+      blacklistHit = true;
+      break;
+    }
+  }
+
+  if (blacklistHit) {
+    score -= 25;
+  }
+
+  if (participant.coreToken && candidate.idTokens.includes('chat') && candidate.idTokens.includes(participant.coreToken)) {
+    score += 10;
+  }
+
+  return score;
+}
+
+function resolveCommandForParticipant(participant, commandCandidates) {
+  const scored = (commandCandidates || []).map((candidate) => ({
+    candidate,
+    score: scoreCommandCandidate(participant, candidate),
+  }));
+
+  scored.sort((left, right) => {
+    if (right.score !== left.score) return right.score - left.score;
+    return left.candidate.id.localeCompare(right.candidate.id);
+  });
+
+  const topCandidates = scored.slice(0, 3).map((entry) => ({
+    id: entry.candidate.id,
+    score: entry.score,
+  }));
+
+  const hintSet = new Set(participant.commandHints || []);
+  const hintMatches = (commandCandidates || [])
+    .filter((candidate) => hintSet.has(candidate.id))
+    .sort((left, right) => left.id.localeCompare(right.id));
+
+  if (hintMatches.length > 0) {
+    return {
+      linkedCommandId: hintMatches[0].id,
+      linkScore: 120,
+      linkReason: 'hint',
+      linkCandidatesTop3: topCandidates,
+    };
+  }
+
+  const aliasAtomSet = new Set((participant.aliases && participant.aliases.atoms) || []);
+  const exactIdMatches = (commandCandidates || [])
+    .filter((candidate) => aliasAtomSet.has(candidate.normalizedIdAtom))
+    .sort((left, right) => left.id.localeCompare(right.id));
+
+  if (exactIdMatches.length > 0) {
+    return {
+      linkedCommandId: exactIdMatches[0].id,
+      linkScore: 90,
+      linkReason: 'exact-id',
+      linkCandidatesTop3: topCandidates,
+    };
+  }
+
+  const weightedMatch = scored.find((entry) => entry.score >= 40);
+  if (weightedMatch) {
+    return {
+      linkedCommandId: weightedMatch.candidate.id,
+      linkScore: weightedMatch.score,
+      linkReason: 'weighted',
+      linkCandidatesTop3: topCandidates,
+    };
+  }
+
+  return {
+    linkedCommandId: '',
+    linkScore: 0,
+    linkReason: 'none',
+    linkCandidatesTop3: topCandidates,
+  };
+}
+
+function resolveParticipantByTarget(participantRegistry, rawTarget) {
+  const target = String(rawTarget || '').replace(/^@/, '').trim();
+  if (!target) return undefined;
+
+  const targetAtom = normalizeAtom(target);
+  const targetTokens = tokenize(target);
+
+  const candidates = [];
+
+  for (const participant of participantRegistry.values()) {
+    const aliasAtoms = participant.aliases && Array.isArray(participant.aliases.atoms)
+      ? participant.aliases.atoms
+      : [];
+    const aliasTokens = participant.aliases && Array.isArray(participant.aliases.tokens)
+      ? participant.aliases.tokens
+      : [];
+
+    const atomMatch = Boolean(targetAtom) && aliasAtoms.includes(targetAtom);
+    const overlapRatio = tokenOverlapRatio(targetTokens, aliasTokens);
+    const tokenMatch = overlapRatio >= 0.6 || targetTokens.some((token) => aliasTokens.includes(token));
+
+    if (!atomMatch && !tokenMatch) continue;
+
+    let score = 0;
+    if (atomMatch) score += 100;
+    if (tokenMatch) score += 60;
+    if (targetTokens.length > 0 && targetTokens.every((token) => aliasTokens.includes(token))) score += 30;
+
+    candidates.push({ participant, score });
+  }
+
+  candidates.sort((left, right) => {
+    if (right.score !== left.score) return right.score - left.score;
+    return left.participant.id.localeCompare(right.participant.id);
+  });
+
+  return candidates.length > 0 ? candidates[0].participant : undefined;
+}
+
 function activate(extensionContext) {
   const output = vscode.window.createOutputChannel('Seamless AI Bridge');
   extensionContext.subscriptions.push(output);
@@ -30,8 +501,15 @@ function activate(extensionContext) {
     output.appendLine(`[${new Date().toISOString()}] ${message}`);
   }
 
-  function normalize(value) {
-    return String(value || '').trim().toLowerCase();
+  const debugEnabled = process.env.SEAMLESS_AI_BRIDGE_DEBUG === '1';
+
+  function debugLog(payload) {
+    if (!debugEnabled) return;
+    if (typeof payload === 'string') {
+      log(`[debug] ${payload}`);
+      return;
+    }
+    log(`[debug] ${JSON.stringify(payload)}`);
   }
 
   function extractChunkText(chunk) {
@@ -55,169 +533,6 @@ function activate(extensionContext) {
     return '';
   }
 
-  function toCommandId(entry) {
-    if (typeof entry === 'string') return entry;
-    if (!entry || typeof entry !== 'object') return '';
-    if (typeof entry.command === 'string') return entry.command;
-    if (typeof entry.id === 'string') return entry.id;
-    return '';
-  }
-
-  function getContributedCommandIds(extension) {
-    const contributes = extension && extension.packageJSON && extension.packageJSON.contributes;
-    const commands = contributes && contributes.commands;
-    if (!Array.isArray(commands)) return [];
-
-    const ids = [];
-    for (const command of commands) {
-      const id = toCommandId(command);
-      if (id) ids.push(id);
-    }
-    return ids;
-  }
-
-  function getParticipantCommandHints(participantContribution) {
-    const hints = new Set();
-    const addHint = (value) => {
-      if (typeof value !== 'string') return;
-      const trimmed = value.trim();
-      if (trimmed) hints.add(trimmed);
-    };
-
-    addHint(participantContribution && participantContribution.command);
-    addHint(participantContribution && participantContribution.defaultCommand);
-
-    const inlineCommands = participantContribution && participantContribution.commands;
-    if (Array.isArray(inlineCommands)) {
-      for (const command of inlineCommands) {
-        addHint(toCommandId(command));
-      }
-    }
-
-    const slashCommands = participantContribution && participantContribution.slashCommands;
-    if (Array.isArray(slashCommands)) {
-      for (const command of slashCommands) {
-        addHint(toCommandId(command));
-      }
-    }
-
-    return Array.from(hints);
-  }
-
-  function pickLinkedCommand(participantRecord, participantContribution, extensionCommandIds) {
-    if (!Array.isArray(extensionCommandIds) || extensionCommandIds.length === 0) return '';
-
-    const hinted = getParticipantCommandHints(participantContribution);
-    for (const hint of hinted) {
-      if (extensionCommandIds.includes(hint)) return hint;
-    }
-
-    const participantId = normalize(participantRecord.id);
-    const shortIdRaw = String(participantRecord.id || '').split('.').pop() || '';
-    const shortId = normalize(shortIdRaw);
-    const participantName = normalize(participantRecord.name);
-    const participantFullName = normalize(participantRecord.fullName);
-
-    let bestCommand = '';
-    let bestScore = 0;
-
-    for (const commandId of extensionCommandIds) {
-      const commandNorm = normalize(commandId);
-      if (!commandNorm) continue;
-
-      let score = 0;
-      if (participantId && commandNorm === participantId) score += 100;
-      if (participantId && commandNorm.includes(participantId)) score += 50;
-      if (shortId && shortId.length >= 3 && commandNorm.includes(shortId)) score += 25;
-      if (participantName && participantName.length >= 3 && commandNorm.includes(participantName)) score += 20;
-      if (participantFullName && participantFullName.length >= 5 && commandNorm.includes(participantFullName)) score += 10;
-
-      if (score > bestScore) {
-        bestScore = score;
-        bestCommand = commandId;
-      }
-    }
-
-    return bestScore > 0 ? bestCommand : '';
-  }
-
-  function detectParticipantsAndCommands() {
-    const participants = [];
-    const participantCommands = new Map();
-
-    for (const extension of vscode.extensions.all) {
-      const contributes = extension
-        && extension.packageJSON
-        && extension.packageJSON.contributes;
-      const contributedParticipants = contributes && contributes.chatParticipants;
-      if (!Array.isArray(contributedParticipants)) continue;
-
-      const extensionCommandIds = getContributedCommandIds(extension);
-
-      for (const participant of contributedParticipants) {
-        if (!participant || typeof participant.id !== 'string') continue;
-
-        const record = {
-          id: participant.id,
-          name: typeof participant.name === 'string' ? participant.name : '',
-          fullName: typeof participant.fullName === 'string' ? participant.fullName : '',
-          extensionId: extension.id,
-        };
-
-        participants.push(record);
-
-        const linkedCommand = pickLinkedCommand(record, participant, extensionCommandIds);
-        if (linkedCommand) {
-          participantCommands.set(record.id, linkedCommand);
-        }
-      }
-    }
-
-    return { participants, participantCommands };
-  }
-
-  let participantRegistry = new Map();
-  let participantCommandRegistry = new Map();
-
-  function refreshParticipantRegistry() {
-    participantRegistry = new Map();
-    participantCommandRegistry = new Map();
-
-    const discovered = detectParticipantsAndCommands();
-
-    log(`Detected ${discovered.participants.length} chat participant(s):`);
-    for (const participant of discovered.participants) {
-      participantRegistry.set(participant.id, participant);
-      const label = participant.name ? `@${participant.name}` : '(no mention name)';
-      log(`- ${label} id=${participant.id} extension=${participant.extensionId}`);
-
-      const linkedCommand = discovered.participantCommands.get(participant.id);
-      if (linkedCommand) {
-        participantCommandRegistry.set(participant.id, linkedCommand);
-        log(`  command=${linkedCommand}`);
-      } else {
-        log('  command=(not found)');
-      }
-    }
-
-    if (discovered.participants.length === 0) {
-      log('- none');
-    }
-  }
-
-  function findParticipantByNameOrId(rawName) {
-    const needle = normalize(rawName);
-    if (!needle) return undefined;
-
-    for (const participant of participantRegistry.values()) {
-      if (normalize(participant.name).includes(needle)) return participant;
-      if (normalize(participant.id).includes(needle)) return participant;
-      if (normalize(participant.fullName).includes(needle)) return participant;
-    }
-
-    return undefined;
-  }
-
   function parseRoutePrompt(prompt) {
     const match = /^@([A-Za-z0-9._-]+)\s+([\s\S]+)$/.exec(prompt.trim());
     if (!match) return undefined;
@@ -227,6 +542,24 @@ function activate(extensionContext) {
     if (!routedPrompt) return undefined;
 
     return { targetName, routedPrompt };
+  }
+
+  function createTrackedResponse(response) {
+    let markdownCount = 0;
+
+    const proxy = Object.create(response);
+    if (typeof response.markdown === 'function') {
+      const originalMarkdown = response.markdown.bind(response);
+      proxy.markdown = (...args) => {
+        markdownCount += 1;
+        return originalMarkdown(...args);
+      };
+    }
+
+    return {
+      response: proxy,
+      getCount: () => markdownCount,
+    };
   }
 
   async function streamForwardResult(result, stream) {
@@ -266,21 +599,167 @@ function activate(extensionContext) {
     return emitted;
   }
 
-  function createTrackedResponse(response) {
-    let markdownCount = 0;
+  function detectParticipantsFromExtensions() {
+    const found = [];
 
-    const proxy = Object.create(response);
-    if (typeof response.markdown === 'function') {
-      const originalMarkdown = response.markdown.bind(response);
-      proxy.markdown = (...args) => {
-        markdownCount += 1;
-        return originalMarkdown(...args);
+    for (const extension of vscode.extensions.all) {
+      const contributions = extension
+        && extension.packageJSON
+        && extension.packageJSON.contributes
+        && extension.packageJSON.contributes.chatParticipants;
+
+      if (!Array.isArray(contributions)) continue;
+
+      for (const participantContribution of contributions) {
+        if (!participantContribution || typeof participantContribution.id !== 'string') continue;
+        found.push(buildParticipantRecord(participantContribution, extension.id));
+      }
+    }
+
+    found.sort((left, right) => left.id.localeCompare(right.id));
+    return found;
+  }
+
+  let participantRegistry = new Map();
+  let commandCatalog = [];
+  let refreshInFlight;
+  let registryReady = false;
+  let lastExperimentalMode;
+
+  async function refreshParticipantRegistry(reason) {
+    if (refreshInFlight) {
+      await refreshInFlight;
+      return;
+    }
+
+    refreshInFlight = (async () => {
+      const participants = detectParticipantsFromExtensions();
+      const contributedCatalog = buildContributedCommandCatalog(vscode.extensions.all);
+
+      let runtimeCommandIds = [];
+      try {
+        runtimeCommandIds = await vscode.commands.getCommands(true);
+      } catch (error) {
+        const message = error && error.message ? error.message : String(error);
+        log(`Unable to read runtime command catalog: ${message}`);
+      }
+
+      commandCatalog = mergeRuntimeCommandCatalog(contributedCatalog, runtimeCommandIds);
+
+      const nextRegistry = new Map();
+      for (const participant of participants) {
+        const link = resolveCommandForParticipant(participant, commandCatalog);
+        const enriched = {
+          ...participant,
+          linkedCommandId: link.linkedCommandId,
+          linkScore: link.linkScore,
+          linkReason: link.linkReason,
+          linkCandidatesTop3: link.linkCandidatesTop3,
+        };
+
+        nextRegistry.set(enriched.id, enriched);
+
+        debugLog({
+          reason,
+          participantId: enriched.id,
+          participantName: enriched.name || enriched.fullName,
+          aliases: enriched.aliases,
+          chosen: {
+            commandId: enriched.linkedCommandId,
+            score: enriched.linkScore,
+            reason: enriched.linkReason,
+          },
+          topCandidates: enriched.linkCandidatesTop3,
+        });
+      }
+
+      participantRegistry = nextRegistry;
+      registryReady = true;
+
+      debugLog({
+        reason,
+        participants: participants.length,
+        commands: commandCatalog.length,
+      });
+    })();
+
+    try {
+      await refreshInFlight;
+    } finally {
+      refreshInFlight = undefined;
+    }
+  }
+
+  function getParticipantCommandById(participantId) {
+    const participant = participantRegistry.get(participantId);
+    return participant && participant.linkedCommandId ? participant.linkedCommandId : '';
+  }
+
+  async function resolveRouteTarget(targetName, options) {
+    const resolvedOptions = options || {};
+    const retryOnMiss = Boolean(resolvedOptions.retryOnMiss);
+
+    const cleanTarget = String(targetName || '').replace(/^@/, '').trim();
+    const queryAtom = normalizeAtom(cleanTarget);
+
+    const buildMissDiagnostics = (participant, topCandidates) => ({
+      target: cleanTarget,
+      aliasAtoms: participant && participant.aliases && Array.isArray(participant.aliases.atoms)
+        ? participant.aliases.atoms
+        : (queryAtom ? [queryAtom] : []),
+      candidateCount: commandCatalog.length,
+      topCandidates: Array.isArray(topCandidates) ? topCandidates.slice(0, 3) : [],
+    });
+
+    let participant = resolveParticipantByTarget(participantRegistry, cleanTarget);
+    let retried = false;
+
+    if (participant && !participant.linkedCommandId && retryOnMiss) {
+      retried = true;
+      await refreshParticipantRegistry('miss-retry');
+      participant = resolveParticipantByTarget(participantRegistry, cleanTarget);
+    }
+
+    if (!participant) {
+      const diagnostics = buildMissDiagnostics(undefined, []);
+      debugLog({
+        target: cleanTarget,
+        resolved: false,
+        diagnostics,
+      });
+
+      return {
+        participant: undefined,
+        commandId: '',
+        linkScore: 0,
+        linkReason: 'none',
+        diagnostics,
+        retried,
       };
     }
 
+    const diagnostics = buildMissDiagnostics(participant, participant.linkCandidatesTop3);
+    debugLog({
+      target: cleanTarget,
+      participantId: participant.id,
+      participantName: participant.name || participant.fullName,
+      aliases: participant.aliases,
+      chosen: {
+        commandId: participant.linkedCommandId,
+        score: participant.linkScore,
+        reason: participant.linkReason,
+      },
+      topCandidates: participant.linkCandidatesTop3,
+      retried,
+    });
+
     return {
-      response: proxy,
-      getCount: () => markdownCount,
+      participant,
+      commandId: participant.linkedCommandId || '',
+      linkScore: participant.linkScore || 0,
+      linkReason: participant.linkReason || 'none',
+      diagnostics,
+      retried,
     };
   }
 
@@ -338,7 +817,6 @@ function activate(extensionContext) {
       try {
         payload = JSON.parse(raw);
       } catch {
-        // Fallback for non-JSON bridge output: route to first pending request.
         const first = pending.entries().next();
         if (!first.done) {
           const [, entry] = first.value;
@@ -458,7 +936,10 @@ function activate(extensionContext) {
   }
 
   log('Activating Seamless AI Bridge.');
-  refreshParticipantRegistry();
+  refreshParticipantRegistry('activate').catch((error) => {
+    const message = error && error.message ? error.message : String(error);
+    log(`Initial participant refresh failed: ${message}`);
+  });
 
   async function handleRequest(request, _chatContext, response, token) {
     const prompt = (request.prompt || '').trim();
@@ -485,8 +966,13 @@ function activate(extensionContext) {
     const bridgeConfig = vscode.workspace.getConfiguration('seamlessAiBridge');
     const isExperimentalMode = Boolean(bridgeConfig.get('experimental.enableCrossParticipantChat', false));
 
-    if (isExperimentalMode) {
-      refreshParticipantRegistry();
+    if (!registryReady) {
+      await refreshParticipantRegistry('first-request');
+    }
+
+    if (lastExperimentalMode !== isExperimentalMode) {
+      await refreshParticipantRegistry('experimental-flag-change');
+      lastExperimentalMode = isExperimentalMode;
     }
 
     const tracked = createTrackedResponse(response);
@@ -501,9 +987,10 @@ function activate(extensionContext) {
       experimentalTimeoutMs: 12000,
       helpers: {
         log,
+        debugLog,
         parseRoutePrompt,
-        findParticipantByNameOrId,
-        getParticipantCommandById: (id) => participantCommandRegistry.get(id),
+        resolveRouteTarget,
+        getParticipantCommandById,
         routeToLocalBridge,
         streamForwardResult,
         executeCommand: (commandId, args) => vscode.commands.executeCommand(commandId, args),
@@ -523,10 +1010,6 @@ function activate(extensionContext) {
       }
 
       log(`Provider orchestration failed: ${message}`);
-      log(`   - Error Name: ${error && error.name}`);
-      log(`   - Error Message: ${error && error.message}`);
-      log(`   - Error Stack: ${error && error.stack}`);
-
       response.markdown('Routing to local bridge due to provider error.');
       await routeToLocalBridge(prompt, response, token);
     }
@@ -540,4 +1023,20 @@ function activate(extensionContext) {
   }));
 }
 
-module.exports = { activate };
+module.exports = {
+  activate,
+  __test: {
+    normalizeAtom,
+    tokenize,
+    buildAliasSet,
+    buildParticipantRecord,
+    buildCommandCandidate,
+    scoreCommandCandidate,
+    resolveCommandForParticipant,
+    resolveParticipantByTarget,
+    tokenOverlapRatio,
+    containsOrderedTokenSequence,
+    buildContributedCommandCatalog,
+    mergeRuntimeCommandCatalog,
+  },
+};
