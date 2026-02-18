@@ -396,6 +396,19 @@ function scoreCommandCandidate(participant, candidate) {
 function resolveCommandForParticipant(participant, commandCandidates, options) {
   const resolvedOptions = options || {};
   const resolutionContext = resolvedOptions.resolutionContext || {};
+  const emitTrace = typeof resolvedOptions.onDebug === 'function'
+    ? resolvedOptions.onDebug
+    : undefined;
+
+  const participantFamilyKey = getParticipantFamilyKey(participant && participant.id);
+  const routedPrompt = typeof resolutionContext.routedPrompt === 'string'
+    ? resolutionContext.routedPrompt
+    : '';
+  const promptIntent = typeof resolutionContext.promptIntent === 'string' && resolutionContext.promptIntent
+    ? resolutionContext.promptIntent
+    : classifyPromptIntent(routedPrompt);
+  const preferredCommandId = getPrimaryCommandPreferences().get(participantFamilyKey) || '';
+  const availableCandidates = (commandCandidates || []).map((candidate) => candidate.id);
 
   const scored = (commandCandidates || []).map((candidate) => ({
     candidate,
@@ -417,72 +430,82 @@ function resolveCommandForParticipant(participant, commandCandidates, options) {
     .filter((candidate) => hintSet.has(candidate.id))
     .sort((left, right) => left.id.localeCompare(right.id));
 
+  let finalResolvedCommand;
+
   if (hintMatches.length > 0) {
-    return {
+    finalResolvedCommand = {
       linkedCommandId: hintMatches[0].id,
       linkScore: 120,
       linkReason: 'hint',
       linkCandidatesTop3: topCandidates,
     };
-  }
+  } else {
+    const aliasAtomSet = new Set((participant.aliases && participant.aliases.atoms) || []);
+    const exactIdMatches = (commandCandidates || [])
+      .filter((candidate) => aliasAtomSet.has(candidate.normalizedIdAtom))
+      .sort((left, right) => left.id.localeCompare(right.id));
 
-  const aliasAtomSet = new Set((participant.aliases && participant.aliases.atoms) || []);
-  const exactIdMatches = (commandCandidates || [])
-    .filter((candidate) => aliasAtomSet.has(candidate.normalizedIdAtom))
-    .sort((left, right) => left.id.localeCompare(right.id));
+    if (exactIdMatches.length > 0) {
+      finalResolvedCommand = {
+        linkedCommandId: exactIdMatches[0].id,
+        linkScore: 90,
+        linkReason: 'exact-id',
+        linkCandidatesTop3: topCandidates,
+      };
+    } else {
+      const targetMode = typeof resolutionContext.targetMode === 'string' && resolutionContext.targetMode
+        ? resolutionContext.targetMode
+        : 'explicit';
 
-  if (exactIdMatches.length > 0) {
-    return {
-      linkedCommandId: exactIdMatches[0].id,
-      linkScore: 90,
-      linkReason: 'exact-id',
-      linkCandidatesTop3: topCandidates,
-    };
-  }
+      if (targetMode === 'generic' && promptIntent === 'general' && preferredCommandId) {
+        const preferredCandidate = (commandCandidates || []).find((candidate) => candidate.id === preferredCommandId);
+        if (preferredCandidate) {
+          finalResolvedCommand = {
+            linkedCommandId: preferredCandidate.id,
+            linkScore: 85,
+            linkReason: 'primary-preference',
+            linkCandidatesTop3: topCandidates,
+          };
+        }
+      }
 
-  const targetMode = typeof resolutionContext.targetMode === 'string' && resolutionContext.targetMode
-    ? resolutionContext.targetMode
-    : 'explicit';
-  const routedPrompt = typeof resolutionContext.routedPrompt === 'string'
-    ? resolutionContext.routedPrompt
-    : '';
-  const promptIntent = typeof resolutionContext.promptIntent === 'string' && resolutionContext.promptIntent
-    ? resolutionContext.promptIntent
-    : classifyPromptIntent(routedPrompt);
-
-  if (targetMode === 'generic' && promptIntent === 'general') {
-    const familyKey = getParticipantFamilyKey(participant.id);
-    const preferredCommandId = getPrimaryCommandPreferences().get(familyKey);
-
-    if (preferredCommandId) {
-      const preferredCandidate = (commandCandidates || []).find((candidate) => candidate.id === preferredCommandId);
-      if (preferredCandidate) {
-        return {
-          linkedCommandId: preferredCandidate.id,
-          linkScore: 85,
-          linkReason: 'primary-preference',
-          linkCandidatesTop3: topCandidates,
-        };
+      if (!finalResolvedCommand) {
+        const weightedMatch = scored.find((entry) => entry.score >= 40);
+        if (weightedMatch) {
+          finalResolvedCommand = {
+            linkedCommandId: weightedMatch.candidate.id,
+            linkScore: weightedMatch.score,
+            linkReason: 'weighted',
+            linkCandidatesTop3: topCandidates,
+          };
+        }
       }
     }
   }
 
-  const weightedMatch = scored.find((entry) => entry.score >= 40);
-  if (weightedMatch) {
-    return {
-      linkedCommandId: weightedMatch.candidate.id,
-      linkScore: weightedMatch.score,
-      linkReason: 'weighted',
+  if (!finalResolvedCommand) {
+    finalResolvedCommand = {
+      linkedCommandId: '',
+      linkScore: 0,
+      linkReason: 'none',
       linkCandidatesTop3: topCandidates,
     };
   }
 
-  return {
-    linkedCommandId: '',
-    linkScore: 0,
-    linkReason: 'none',
-    linkCandidatesTop3: topCandidates,
-  };
+  if (emitTrace) {
+    emitTrace({
+      type: 'command-selection-trace',
+      participantId: participant && participant.id ? participant.id : '',
+      participantFamilyKey,
+      promptIntent,
+      preferredCommand: preferredCommandId || 'none',
+      availableCandidates,
+      finalResolvedCommandId: finalResolvedCommand.linkedCommandId || 'none',
+      resolutionReason: finalResolvedCommand.linkReason || 'fallback',
+    });
+  }
+
+  return finalResolvedCommand;
 }
 
 
@@ -796,7 +819,9 @@ function activate(extensionContext) {
 
       const nextRegistry = new Map();
       for (const participant of participants) {
-        const link = resolveCommandForParticipant(participant, commandCatalog);
+        const link = resolveCommandForParticipant(participant, commandCatalog, {
+          onDebug: (payload) => debugLog(payload),
+        });
         const enriched = {
           ...participant,
           linkedCommandId: link.linkedCommandId,
@@ -865,6 +890,7 @@ function activate(extensionContext) {
         routedPrompt,
         promptIntent,
       },
+      onDebug: (payload) => debugLog(payload),
     });
 
     const emptyCommandLink = {

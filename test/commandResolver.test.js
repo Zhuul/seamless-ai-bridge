@@ -126,6 +126,39 @@ suite('Command Resolver', () => {
     }
   });
 
+  test('emits command-selection-trace payload for generic copilot resolution', () => {
+    const participant = buildDefaultCopilotParticipant();
+    const candidates = [
+      buildCommandCandidate('github.copilot.chat.applyCopilotCLIAgentSessionChanges', 'Apply CLI Agent Session Changes', 'Chat', 'contributed'),
+      buildCommandCandidate('github.copilot.chat.ask', 'Ask', 'Chat', 'contributed'),
+    ];
+
+    const traces = [];
+    const resolved = resolveCommandForParticipant(participant, candidates, {
+      resolutionContext: {
+        targetMode: 'generic',
+        routedPrompt: 'Please plan a simple REST API for a blog with endpoints for users and posts.',
+      },
+      onDebug: (payload) => traces.push(payload),
+    });
+
+    assert.strictEqual(resolved.linkedCommandId, 'github.copilot.chat.ask');
+    assert.strictEqual(traces.length, 1);
+
+    const trace = traces[0];
+    assert.strictEqual(trace.type, 'command-selection-trace');
+    assert.strictEqual(trace.participantId, 'github.copilot.default');
+    assert.strictEqual(trace.participantFamilyKey, 'github.copilot');
+    assert.strictEqual(trace.promptIntent, 'general');
+    assert.strictEqual(trace.preferredCommand, 'github.copilot.chat.ask');
+    assert.deepStrictEqual(trace.availableCandidates, [
+      'github.copilot.chat.applyCopilotCLIAgentSessionChanges',
+      'github.copilot.chat.ask',
+    ]);
+    assert.strictEqual(trace.finalResolvedCommandId, 'github.copilot.chat.ask');
+    assert.strictEqual(trace.resolutionReason, 'primary-preference');
+  });
+
   test('explicit hint still overrides preferred command policy', () => {
     const participant = buildDefaultCopilotParticipant({
       command: 'github.copilot.chat.applyCopilotCLIAgentSessionChanges',
