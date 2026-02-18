@@ -683,6 +683,42 @@ function activate(extensionContext) {
     log(`[debug] ${JSON.stringify(payload)}`);
   }
 
+  function serializeError(error) {
+    if (!error || typeof error !== 'object') {
+      return {
+        name: 'Error',
+        message: String(error),
+        stack: '',
+      };
+    }
+
+    const err = error;
+    const details = {
+      name: typeof err.name === 'string' && err.name ? err.name : 'Error',
+      message: typeof err.message === 'string' && err.message ? err.message : String(err),
+      stack: typeof err.stack === 'string' ? err.stack : '',
+    };
+
+    const enumerable = {};
+    for (const key of Object.keys(err)) {
+      if (key === 'name' || key === 'message' || key === 'stack') continue;
+      const value = err[key];
+      if (value === undefined) continue;
+      if (typeof value === 'function') continue;
+      try {
+        enumerable[key] = value;
+      } catch {
+        enumerable[key] = '[unserializable]';
+      }
+    }
+
+    if (Object.keys(enumerable).length > 0) {
+      details.details = enumerable;
+    }
+
+    return details;
+  }
+
   function extractChunkText(chunk) {
     if (typeof chunk === 'string') return chunk;
     if (!chunk || typeof chunk !== 'object') return '';
@@ -1163,76 +1199,196 @@ function activate(extensionContext) {
   });
 
   async function handleRequest(request, _chatContext, response, token) {
-    const prompt = (request.prompt || '').trim();
+    const requestId = Math.random().toString(36).slice(2);
+    const prompt = (request && typeof request.prompt === 'string' ? request.prompt : '').trim();
+    let phase = 'entered';
 
-    if (prompt.startsWith('/exec ')) {
-      const cmd = prompt.slice(6).trim();
-      const cwd = vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0
-        ? vscode.workspace.workspaceFolders[0].uri.fsPath
-        : undefined;
-      response.markdown(`cwd: ${cwd || process.cwd()}`);
-      response.markdown(`$ ${cmd}`);
-      const { code, stdout, stderr } = await runShell(cmd, cwd, token);
-      if (stdout) response.markdown(['```', stdout, '```'].join('\n'));
-      if (stderr) response.markdown(['stderr:', '```', stderr, '```'].join('\n'));
-      if (code !== 0) response.markdown(`Process exited with code ${code}`);
-      return;
-    }
-
-    if (!prompt) {
-      response.markdown('Type a prompt for @bridge.');
-      return;
-    }
-
-    const bridgeConfig = vscode.workspace.getConfiguration('seamlessAiBridge');
-    const isExperimentalMode = Boolean(bridgeConfig.get('experimental.enableCrossParticipantChat', false));
-
-    if (!registryReady) {
-      await refreshParticipantRegistry('first-request');
-    }
-
-    if (lastExperimentalMode !== isExperimentalMode) {
-      await refreshParticipantRegistry('experimental-flag-change');
-      lastExperimentalMode = isExperimentalMode;
-    }
-
-    const tracked = createTrackedResponse(response);
-    const providerContext = {
-      userPrompt: prompt,
-    };
-
-    const providerOptions = {
-      isExperimentalMode,
-      response: tracked.response,
-      token,
-      experimentalTimeoutMs: 12000,
-      helpers: {
-        log,
-        debugLog,
-        parseRoutePrompt,
-        resolveRouteTarget,
-        getParticipantCommandById,
-        routeToLocalBridge,
-        streamForwardResult,
-        executeCommand: (commandId, args) => vscode.commands.executeCommand(commandId, args),
-        getResponseCount: tracked.getCount,
-        bridgeParticipantId: 'seamless-ai-bridge',
-      },
-    };
+    debugLog({
+      type: 'provide-response-trace',
+      requestId,
+      phase,
+      promptLength: prompt.length,
+      cancelled: Boolean(token && token.isCancellationRequested),
+    });
 
     try {
-      const planText = await plannerProvider.getPlan(prompt, providerContext, providerOptions);
-      await coderProvider.getCode(planText, providerContext, providerOptions);
+      phase = 'prompt-check';
+
+      if (prompt.startsWith('/exec ')) {
+        phase = 'exec-command';
+        const cmd = prompt.slice(6).trim();
+        const cwd = vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0
+          ? vscode.workspace.workspaceFolders[0].uri.fsPath
+          : undefined;
+
+        debugLog({
+          type: 'provide-response-trace',
+          requestId,
+          phase,
+          commandLength: cmd.length,
+          hasWorkspaceCwd: Boolean(cwd),
+        });
+
+        response.markdown(`cwd: ${cwd || process.cwd()}`);
+        response.markdown(`$ ${cmd}`);
+        const { code, stdout, stderr } = await runShell(cmd, cwd, token);
+        if (stdout) response.markdown(['```', stdout, '```'].join('\n'));
+        if (stderr) response.markdown(['stderr:', '```', stderr, '```'].join('\n'));
+        if (code !== 0) response.markdown(`Process exited with code ${code}`);
+
+        debugLog({
+          type: 'provide-response-trace',
+          requestId,
+          phase: 'exec-complete',
+          code,
+        });
+        return;
+      }
+
+      if (!prompt) {
+        debugLog({
+          type: 'provide-response-trace',
+          requestId,
+          phase: 'empty-prompt',
+        });
+        response.markdown('Type a prompt for @bridge.');
+        return;
+      }
+
+      phase = 'load-config';
+      const bridgeConfig = vscode.workspace.getConfiguration('seamlessAiBridge');
+      const isExperimentalMode = Boolean(bridgeConfig.get('experimental.enableCrossParticipantChat', false));
+
+      debugLog({
+        type: 'provide-response-trace',
+        requestId,
+        phase,
+        isExperimentalMode,
+        registryReady,
+      });
+
+      if (!registryReady) {
+        phase = 'refresh-first-request';
+        debugLog({ type: 'provide-response-trace', requestId, phase, started: true });
+        await refreshParticipantRegistry('first-request');
+        debugLog({ type: 'provide-response-trace', requestId, phase, started: false, completed: true });
+      }
+
+      if (lastExperimentalMode !== isExperimentalMode) {
+        phase = 'refresh-experimental-flag-change';
+        debugLog({ type: 'provide-response-trace', requestId, phase, started: true });
+        await refreshParticipantRegistry('experimental-flag-change');
+        lastExperimentalMode = isExperimentalMode;
+        debugLog({ type: 'provide-response-trace', requestId, phase, started: false, completed: true });
+      }
+
+      phase = 'provider-setup';
+      const tracked = createTrackedResponse(response);
+      const providerContext = {
+        userPrompt: prompt,
+      };
+
+      const providerOptions = {
+        isExperimentalMode,
+        response: tracked.response,
+        token,
+        experimentalTimeoutMs: 12000,
+        helpers: {
+          log,
+          debugLog,
+          parseRoutePrompt,
+          resolveRouteTarget,
+          getParticipantCommandById,
+          routeToLocalBridge,
+          streamForwardResult,
+          executeCommand: (commandId, args) => vscode.commands.executeCommand(commandId, args),
+          getResponseCount: tracked.getCount,
+          bridgeParticipantId: 'seamless-ai-bridge',
+        },
+      };
+
+      debugLog({
+        type: 'provide-response-trace',
+        requestId,
+        phase,
+        routed: Boolean(parseRoutePrompt(prompt)),
+      });
+
+      try {
+        phase = 'planner-get-plan';
+        debugLog({ type: 'provide-response-trace', requestId, phase, started: true });
+        const planText = await plannerProvider.getPlan(prompt, providerContext, providerOptions);
+
+        debugLog({
+          type: 'provide-response-trace',
+          requestId,
+          phase,
+          started: false,
+          completed: true,
+          planTextLength: typeof planText === 'string' ? planText.length : 0,
+        });
+
+        phase = 'coder-get-code';
+        debugLog({ type: 'provide-response-trace', requestId, phase, started: true });
+        await coderProvider.getCode(planText, providerContext, providerOptions);
+        debugLog({ type: 'provide-response-trace', requestId, phase, started: false, completed: true });
+      } catch (error) {
+        const errorInfo = serializeError(error);
+        debugLog({
+          type: 'provide-response-error',
+          requestId,
+          phase,
+          scope: 'provider-orchestration',
+          error: errorInfo,
+        });
+
+        if (errorInfo.message === 'Cancelled') {
+          response.markdown('Cancelled');
+          return;
+        }
+
+        log(`Provider orchestration failed at ${phase}: ${errorInfo.message}`);
+        if (errorInfo.stack) {
+          log(`Provider orchestration stack (${requestId}): ${errorInfo.stack}`);
+        }
+
+        response.markdown('Routing to local bridge due to provider error.');
+        debugLog({
+          type: 'provide-response-trace',
+          requestId,
+          phase: 'provider-fallback-local-bridge',
+          started: true,
+        });
+        await routeToLocalBridge(prompt, response, token);
+      }
     } catch (error) {
-      const message = error && error.message ? error.message : String(error);
-      if (message === 'Cancelled') {
+      const errorInfo = serializeError(error);
+      debugLog({
+        type: 'provide-response-error',
+        requestId,
+        phase,
+        scope: 'handle-request',
+        error: errorInfo,
+      });
+
+      if (errorInfo.message === 'Cancelled') {
         response.markdown('Cancelled');
         return;
       }
 
-      log(`Provider orchestration failed: ${message}`);
-      response.markdown('Routing to local bridge due to provider error.');
+      log(`Request handling failed at ${phase}: ${errorInfo.message}`);
+      if (errorInfo.stack) {
+        log(`Request handling stack (${requestId}): ${errorInfo.stack}`);
+      }
+
+      response.markdown('Routing to local bridge due to handler error.');
       await routeToLocalBridge(prompt, response, token);
+    } finally {
+      debugLog({
+        type: 'provide-response-trace',
+        requestId,
+        phase: 'exit',
+      });
     }
   }
 
