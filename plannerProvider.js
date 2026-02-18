@@ -67,6 +67,23 @@ function fallbackResolveRouteTarget(targetName, options) {
     retried: false,
   };
 }
+function normalizeTargetAtom(value) {
+  return String(value || '')
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '');
+}
+
+function deriveTargetMode(targetName) {
+  const atom = normalizeTargetAtom(targetName);
+  if (atom === 'copilot' || atom === 'githubcopilot') {
+    return 'generic';
+  }
+
+  return 'explicit';
+}
+
 
 async function getPlan(userPrompt, context, options) {
   void context;
@@ -101,7 +118,13 @@ async function getPlan(userPrompt, context, options) {
     ? routed.routedPrompt
     : safePrompt;
 
-  const resolved = await resolveRouteTarget(routed.targetName, { retryOnMiss: true });
+  const resolved = await resolveRouteTarget(routed.targetName, {
+    retryOnMiss: true,
+    resolutionContext: {
+      routedPrompt,
+      targetMode: deriveTargetMode(routed.targetName),
+    },
+  });
   const participant = resolved && resolved.participant;
   const diagnostics = compactDiagnostics(resolved && resolved.diagnostics, routed.targetName);
 

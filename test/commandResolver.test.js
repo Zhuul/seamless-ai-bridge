@@ -30,6 +30,15 @@ function buildCopilotRegistry() {
   ]);
 }
 
+function buildDefaultCopilotParticipant(extra) {
+  return buildParticipantRecord({
+    id: 'github.copilot.default',
+    name: 'GitHubCopilot',
+    fullName: 'GitHub Copilot',
+    ...extra,
+  }, 'GitHub.copilot-chat');
+}
+
 suite('Command Resolver', () => {
   test('alias equivalence normalization', () => {
     const forms = [
@@ -97,30 +106,89 @@ suite('Command Resolver', () => {
     }
   });
 
-  test('hint ID precedence', () => {
-    const participant = buildParticipantRecord({
-      id: 'github.copilot.default',
-      name: 'GitHubCopilot',
-      fullName: 'GitHub Copilot',
-      command: 'vendor.hint.command',
-    }, 'GitHub.copilot-chat');
-
+  test('generic copilot prompt prefers ask over apply operational command', () => {
+    const participant = buildDefaultCopilotParticipant();
     const candidates = [
-      buildCommandCandidate('vendor.hint.command', 'Hint Command', 'Chat', 'runtime'),
+      buildCommandCandidate('github.copilot.chat.applyCopilotCLIAgentSessionChanges', 'Apply CLI Agent Session Changes', 'Chat', 'contributed'),
       buildCommandCandidate('github.copilot.chat.ask', 'Ask', 'Chat', 'contributed'),
     ];
 
-    const resolved = resolveCommandForParticipant(participant, candidates);
+    for (let i = 0; i < 20; i += 1) {
+      const resolved = resolveCommandForParticipant(participant, candidates, {
+        resolutionContext: {
+          targetMode: 'generic',
+          routedPrompt: 'What is the current status of this project?',
+        },
+      });
+
+      assert.strictEqual(resolved.linkReason, 'primary-preference');
+      assert.strictEqual(resolved.linkedCommandId, 'github.copilot.chat.ask');
+    }
+  });
+
+  test('explicit hint still overrides preferred command policy', () => {
+    const participant = buildDefaultCopilotParticipant({
+      command: 'github.copilot.chat.applyCopilotCLIAgentSessionChanges',
+    });
+    const candidates = [
+      buildCommandCandidate('github.copilot.chat.applyCopilotCLIAgentSessionChanges', 'Apply CLI Agent Session Changes', 'Chat', 'contributed'),
+      buildCommandCandidate('github.copilot.chat.ask', 'Ask', 'Chat', 'contributed'),
+    ];
+
+    const resolved = resolveCommandForParticipant(participant, candidates, {
+      resolutionContext: {
+        targetMode: 'generic',
+        routedPrompt: 'What is the current status of this project?',
+      },
+    });
+
     assert.strictEqual(resolved.linkReason, 'hint');
-    assert.strictEqual(resolved.linkedCommandId, 'vendor.hint.command');
+    assert.strictEqual(resolved.linkedCommandId, 'github.copilot.chat.applyCopilotCLIAgentSessionChanges');
+  });
+
+  test('no configured family preference falls back to weighted lexical ordering', () => {
+    const participant = buildParticipantRecord({
+      id: 'vendor.foo',
+      name: 'foo',
+      fullName: 'Vendor Foo',
+    }, 'vendor.extension');
+
+    const candidates = [
+      buildCommandCandidate('vendor.foo.chat.beta', 'Foo Chat', 'Chat', 'runtime'),
+      buildCommandCandidate('vendor.foo.chat.alpha', 'Foo Chat', 'Chat', 'runtime'),
+    ];
+
+    const resolved = resolveCommandForParticipant(participant, candidates, {
+      resolutionContext: {
+        targetMode: 'generic',
+        routedPrompt: 'general question',
+      },
+    });
+
+    assert.strictEqual(resolved.linkReason, 'weighted');
+    assert.strictEqual(resolved.linkedCommandId, 'vendor.foo.chat.alpha');
+  });
+
+  test('operational intent does not force ask for explicit route intent', () => {
+    const participant = buildDefaultCopilotParticipant();
+    const candidates = [
+      buildCommandCandidate('github.copilot.chat.applyCopilotCLIAgentSessionChanges', 'Apply CLI Agent Session Changes', 'Chat', 'contributed'),
+      buildCommandCandidate('github.copilot.chat.ask', 'Ask', 'Chat', 'contributed'),
+    ];
+
+    const resolved = resolveCommandForParticipant(participant, candidates, {
+      resolutionContext: {
+        targetMode: 'explicit',
+        routedPrompt: 'apply replay session changes now',
+      },
+    });
+
+    assert.strictEqual(resolved.linkReason, 'weighted');
+    assert.strictEqual(resolved.linkedCommandId, 'github.copilot.chat.applyCopilotCLIAgentSessionChanges');
   });
 
   test('runtime-only command mapping success', () => {
-    const participant = buildParticipantRecord({
-      id: 'github.copilot.default',
-      name: 'GitHubCopilot',
-      fullName: 'GitHub Copilot',
-    }, 'GitHub.copilot-chat');
+    const participant = buildDefaultCopilotParticipant();
 
     const candidates = [
       buildCommandCandidate('github.copilot.chat.ask', '', '', 'runtime'),
@@ -149,23 +217,6 @@ suite('Command Resolver', () => {
     assert.strictEqual(resolved.linkedCommandId, 'github.copilot.chat.replay.enableWorkspaceEditTracing');
     assert.strictEqual(resolved.linkReason, 'weighted');
     assert.ok(resolved.linkScore >= 40);
-  });
-
-  test('deterministic tie-break by lexical command id', () => {
-    const participant = buildParticipantRecord({
-      id: 'vendor.foo',
-      name: 'foo',
-      fullName: 'Vendor Foo',
-    }, 'vendor.extension');
-
-    const candidates = [
-      buildCommandCandidate('vendor.foo.chat.beta', 'Foo Chat', 'Chat', 'runtime'),
-      buildCommandCandidate('vendor.foo.chat.alpha', 'Foo Chat', 'Chat', 'runtime'),
-    ];
-
-    const resolved = resolveCommandForParticipant(participant, candidates);
-    assert.strictEqual(resolved.linkReason, 'weighted');
-    assert.strictEqual(resolved.linkedCommandId, 'vendor.foo.chat.alpha');
   });
 
   test('threshold rejection below 40', () => {

@@ -68,11 +68,56 @@ suite('Provider Layer', () => {
     assert.strictEqual(calls.length, 1);
     assert.strictEqual(calls[0].targetName, 'copilot');
     assert.strictEqual(calls[0].options.retryOnMiss, true);
+    assert.strictEqual(calls[0].options.resolutionContext.routedPrompt, 'create a rest api');
+    assert.strictEqual(calls[0].options.resolutionContext.targetMode, 'generic');
 
     const plan = JSON.parse(planText);
     assert.strictEqual(plan.mode, 'experimental');
     assert.strictEqual(plan.commandId, 'github.copilot.chat.ask');
     assert.strictEqual(plan.retryAttempted, true);
+  });
+
+  test('planner passes explicit target mode context for non-generic targets', async () => {
+    const calls = [];
+
+    const planText = await plannerProvider.getPlan('@workspace summarize current repo', {}, {
+      isExperimentalMode: true,
+      response: { markdown() {} },
+      token: undefined,
+      helpers: {
+        parseRoutePrompt: (prompt) => {
+          const match = /^@([^\s]+)\s+([\s\S]+)$/.exec(prompt.trim());
+          if (!match) return undefined;
+          return { targetName: match[1], routedPrompt: match[2].trim() };
+        },
+        resolveRouteTarget: async (targetName, options) => {
+          calls.push({ targetName, options });
+          return {
+            participant: { id: 'github.copilot.workspace', name: 'workspace' },
+            commandId: 'github.copilot.chat.replay.enableWorkspaceEditTracing',
+            linkScore: 92,
+            linkReason: 'weighted',
+            retried: false,
+            diagnostics: {
+              target: 'workspace',
+              aliasAtoms: ['workspace'],
+              candidateCount: 24,
+              topCandidates: [{ id: 'github.copilot.chat.replay.enableWorkspaceEditTracing', score: 92 }],
+            },
+          };
+        },
+        bridgeParticipantId: 'seamless-ai-bridge',
+      },
+    });
+
+    assert.strictEqual(calls.length, 1);
+    assert.strictEqual(calls[0].targetName, 'workspace');
+    assert.strictEqual(calls[0].options.resolutionContext.routedPrompt, 'summarize current repo');
+    assert.strictEqual(calls[0].options.resolutionContext.targetMode, 'explicit');
+
+    const plan = JSON.parse(planText);
+    assert.strictEqual(plan.mode, 'experimental');
+    assert.strictEqual(plan.targetId, 'github.copilot.workspace');
   });
 
   test('planner refresh-on-miss then fallback with diagnostics', async () => {

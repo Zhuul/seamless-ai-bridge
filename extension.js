@@ -7,6 +7,7 @@ const coderProvider = require('./coderProvider');
 
 const BLACKLIST_TOKENS = new Set(['test', 'debug', 'internal', 'sample']);
 const CORE_CHAT_TOKENS = new Set(['copilot', 'codex']);
+const OPERATIONAL_INTENT_TOKENS = new Set(['apply', 'replay', 'session', 'enable', 'disable']);
 
 function runShell(command, cwd, token) {
   return new Promise((resolve) => {
@@ -392,7 +393,10 @@ function scoreCommandCandidate(participant, candidate) {
   return score;
 }
 
-function resolveCommandForParticipant(participant, commandCandidates) {
+function resolveCommandForParticipant(participant, commandCandidates, options) {
+  const resolvedOptions = options || {};
+  const resolutionContext = resolvedOptions.resolutionContext || {};
+
   const scored = (commandCandidates || []).map((candidate) => ({
     candidate,
     score: scoreCommandCandidate(participant, candidate),
@@ -436,6 +440,33 @@ function resolveCommandForParticipant(participant, commandCandidates) {
     };
   }
 
+  const targetMode = typeof resolutionContext.targetMode === 'string' && resolutionContext.targetMode
+    ? resolutionContext.targetMode
+    : 'explicit';
+  const routedPrompt = typeof resolutionContext.routedPrompt === 'string'
+    ? resolutionContext.routedPrompt
+    : '';
+  const promptIntent = typeof resolutionContext.promptIntent === 'string' && resolutionContext.promptIntent
+    ? resolutionContext.promptIntent
+    : classifyPromptIntent(routedPrompt);
+
+  if (targetMode === 'generic' && promptIntent === 'general') {
+    const familyKey = getParticipantFamilyKey(participant.id);
+    const preferredCommandId = getPrimaryCommandPreferences().get(familyKey);
+
+    if (preferredCommandId) {
+      const preferredCandidate = (commandCandidates || []).find((candidate) => candidate.id === preferredCommandId);
+      if (preferredCandidate) {
+        return {
+          linkedCommandId: preferredCandidate.id,
+          linkScore: 85,
+          linkReason: 'primary-preference',
+          linkCandidatesTop3: topCandidates,
+        };
+      }
+    }
+  }
+
   const weightedMatch = scored.find((entry) => entry.score >= 40);
   if (weightedMatch) {
     return {
@@ -453,6 +484,7 @@ function resolveCommandForParticipant(participant, commandCandidates) {
     linkCandidatesTop3: topCandidates,
   };
 }
+
 
 function isGenericCoreTarget(target) {
   const cleanTarget = String(target || '').replace(/^@/, '').trim();
@@ -482,6 +514,20 @@ function getParticipantFamilyKey(participantId) {
 
 function getPrimaryVariantRank(participantId) {
   return String(participantId || '').endsWith('.default') ? 0 : 1;
+}
+function getPrimaryCommandPreferences() {
+  return new Map([
+    ['github.copilot', 'github.copilot.chat.ask'],
+  ]);
+}
+
+function classifyPromptIntent(promptText) {
+  const tokens = tokenize(promptText);
+  if (tokens.some((token) => OPERATIONAL_INTENT_TOKENS.has(token))) {
+    return 'operational';
+  }
+
+  return 'general';
 }
 
 
@@ -800,9 +846,33 @@ function activate(extensionContext) {
   async function resolveRouteTarget(targetName, options) {
     const resolvedOptions = options || {};
     const retryOnMiss = Boolean(resolvedOptions.retryOnMiss);
+    const resolutionContext = resolvedOptions.resolutionContext || {};
 
     const cleanTarget = String(targetName || '').replace(/^@/, '').trim();
     const queryAtom = normalizeAtom(cleanTarget);
+    const targetMode = typeof resolutionContext.targetMode === 'string' && resolutionContext.targetMode
+      ? resolutionContext.targetMode
+      : (isGenericCoreTarget(cleanTarget) ? 'generic' : 'explicit');
+    const routedPrompt = typeof resolutionContext.routedPrompt === 'string'
+      ? resolutionContext.routedPrompt
+      : '';
+    const promptIntent = classifyPromptIntent(routedPrompt);
+
+    const resolveCommandLink = (participant) => resolveCommandForParticipant(participant, commandCatalog, {
+      resolutionContext: {
+        ...resolutionContext,
+        targetMode,
+        routedPrompt,
+        promptIntent,
+      },
+    });
+
+    const emptyCommandLink = {
+      linkedCommandId: '',
+      linkScore: 0,
+      linkReason: 'none',
+      linkCandidatesTop3: [],
+    };
 
     const buildMissDiagnostics = (participant, topCandidates) => ({
       target: cleanTarget,
@@ -820,9 +890,10 @@ function activate(extensionContext) {
         ...payload,
       }),
     });
+    let commandLink = participant ? resolveCommandLink(participant) : emptyCommandLink;
     let retried = false;
 
-    if (participant && !participant.linkedCommandId && retryOnMiss) {
+    if (participant && !commandLink.linkedCommandId && retryOnMiss) {
       retried = true;
       await refreshParticipantRegistry('miss-retry');
       participant = resolveParticipantByTarget(participantRegistry, cleanTarget, {
@@ -832,6 +903,7 @@ function activate(extensionContext) {
           ...payload,
         }),
       });
+      commandLink = participant ? resolveCommandLink(participant) : emptyCommandLink;
     }
 
     if (!participant) {
@@ -839,6 +911,10 @@ function activate(extensionContext) {
       debugLog({
         target: cleanTarget,
         resolved: false,
+        resolutionContext: {
+          targetMode,
+          promptIntent,
+        },
         diagnostics,
       });
 
@@ -852,30 +928,35 @@ function activate(extensionContext) {
       };
     }
 
-    const diagnostics = buildMissDiagnostics(participant, participant.linkCandidatesTop3);
+    const diagnostics = buildMissDiagnostics(participant, commandLink.linkCandidatesTop3);
     debugLog({
       target: cleanTarget,
       participantId: participant.id,
       participantName: participant.name || participant.fullName,
       aliases: participant.aliases,
-      chosen: {
-        commandId: participant.linkedCommandId,
-        score: participant.linkScore,
-        reason: participant.linkReason,
+      resolutionContext: {
+        targetMode,
+        promptIntent,
       },
-      topCandidates: participant.linkCandidatesTop3,
+      chosen: {
+        commandId: commandLink.linkedCommandId,
+        score: commandLink.linkScore,
+        reason: commandLink.linkReason,
+      },
+      topCandidates: commandLink.linkCandidatesTop3,
       retried,
     });
 
     return {
       participant,
-      commandId: participant.linkedCommandId || '',
-      linkScore: participant.linkScore || 0,
-      linkReason: participant.linkReason || 'none',
+      commandId: commandLink.linkedCommandId || '',
+      linkScore: commandLink.linkScore || 0,
+      linkReason: commandLink.linkReason || 'none',
       diagnostics,
       retried,
     };
   }
+
 
   let bridgeInstance;
 
@@ -1148,6 +1229,9 @@ module.exports = {
     scoreCommandCandidate,
     resolveCommandForParticipant,
     resolveParticipantByTarget,
+    getParticipantFamilyKey,
+    getPrimaryCommandPreferences,
+    classifyPromptIntent,
     tokenOverlapRatio,
     containsOrderedTokenSequence,
     buildContributedCommandCatalog,
