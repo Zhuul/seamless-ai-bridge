@@ -149,6 +149,7 @@ suite('Command Resolver', () => {
     assert.strictEqual(trace.type, 'command-selection-trace');
     assert.strictEqual(trace.participantId, 'github.copilot.default');
     assert.strictEqual(trace.participantFamilyKey, 'github.copilot');
+    assert.strictEqual(trace.targetMode, 'generic');
     assert.strictEqual(trace.promptIntent, 'general');
     assert.strictEqual(trace.preferredCommand, 'github.copilot.chat.ask');
     assert.deepStrictEqual(trace.availableCandidates, [

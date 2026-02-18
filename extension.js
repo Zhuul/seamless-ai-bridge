@@ -407,6 +407,9 @@ function resolveCommandForParticipant(participant, commandCandidates, options) {
   const promptIntent = typeof resolutionContext.promptIntent === 'string' && resolutionContext.promptIntent
     ? resolutionContext.promptIntent
     : classifyPromptIntent(routedPrompt);
+  const targetMode = typeof resolutionContext.targetMode === 'string' && resolutionContext.targetMode
+    ? resolutionContext.targetMode
+    : 'explicit';
   const preferredCommandId = getPrimaryCommandPreferences().get(participantFamilyKey) || '';
   const availableCandidates = (commandCandidates || []).map((candidate) => candidate.id);
 
@@ -453,10 +456,6 @@ function resolveCommandForParticipant(participant, commandCandidates, options) {
         linkCandidatesTop3: topCandidates,
       };
     } else {
-      const targetMode = typeof resolutionContext.targetMode === 'string' && resolutionContext.targetMode
-        ? resolutionContext.targetMode
-        : 'explicit';
-
       if (targetMode === 'generic' && promptIntent === 'general' && preferredCommandId) {
         const preferredCandidate = (commandCandidates || []).find((candidate) => candidate.id === preferredCommandId);
         if (preferredCandidate) {
@@ -497,6 +496,7 @@ function resolveCommandForParticipant(participant, commandCandidates, options) {
       type: 'command-selection-trace',
       participantId: participant && participant.id ? participant.id : '',
       participantFamilyKey,
+      targetMode,
       promptIntent,
       preferredCommand: preferredCommandId || 'none',
       availableCandidates,
