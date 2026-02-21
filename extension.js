@@ -58,6 +58,15 @@ function normalizePersonaAlias(value) {
 }
 
 function sanitizeModelSelector(value) {
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed) return undefined;
+    return {
+      vendor: 'copilot',
+      family: trimmed,
+    };
+  }
+
   if (!value || typeof value !== 'object') return undefined;
 
   const selector = {};
@@ -939,7 +948,9 @@ function activate(extensionContext) {
   }
 
   function debugLog(payload) {
-    const debugEnabled = Boolean(vscode.workspace.getConfiguration('seamless-ai-bridge').get('debug.enabled', false));
+    const debugEnabledLegacy = Boolean(vscode.workspace.getConfiguration('seamless-ai-bridge').get('debug.enabled', false));
+    const debugEnabledV4 = Boolean(vscode.workspace.getConfiguration('seamlessAiBridge').get('debug.enabled', false));
+    const debugEnabled = debugEnabledLegacy || debugEnabledV4;
     if (!debugEnabled) return;
     if (typeof payload === 'string') {
       log(`[debug] ${payload}`);

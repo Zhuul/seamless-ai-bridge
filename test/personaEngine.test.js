@@ -41,6 +41,20 @@ suite('Persona Engine', () => {
     assert.strictEqual(personas.get('planner').modelSelector.family, 'gpt-4o');
   });
 
+  test('supports string modelSelector shorthand', () => {
+    const personas = readConfiguredPersonas([
+      {
+        alias: '@planner',
+        modelSelector: 'gpt-4.1',
+      },
+    ]);
+
+    assert.strictEqual(personas.size, 1);
+    assert.ok(personas.has('planner'));
+    assert.strictEqual(personas.get('planner').modelSelector.vendor, 'copilot');
+    assert.strictEqual(personas.get('planner').modelSelector.family, 'gpt-4.1');
+  });
+
   test('uses hybrid persona parsing behavior', () => {
     const personas = readConfiguredPersonas([
       { alias: 'planner' },
