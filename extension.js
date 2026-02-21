@@ -574,14 +574,22 @@ function getPreferredCommandForFamily(familyKey, commandCandidates) {
     .map((candidate) => {
       const idTokens = Array.isArray(candidate.idTokens) ? candidate.idTokens : tokenize(candidate.id);
       const hasOperationalToken = idTokens.some((token) => OPERATIONAL_INTENT_TOKENS.has(token));
+      const hasCloudSessionToken = idTokens.some((token) => (
+        token === 'cloud'
+        || token === 'sessions'
+        || token === 'repository'
+        || token === 'codespaces'
+      ));
 
       let score = 0;
       if (idTokens.includes('chat')) score += 60;
       if (idTokens.includes('ask')) score += 120;
+      if (idTokens.includes('submit')) score += 110;
       if (idTokens.includes('open')) score += 50;
       if (idTokens.includes('send')) score += 45;
       if (idTokens.includes('new')) score += 35;
       if (hasOperationalToken) score -= 80;
+      if (hasCloudSessionToken) score -= 120;
 
       return {
         id: candidate.id,

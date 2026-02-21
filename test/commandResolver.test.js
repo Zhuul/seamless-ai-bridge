@@ -182,6 +182,28 @@ suite('Command Resolver', () => {
     assert.strictEqual(traces[0].preferredCommand, 'github.copilot.chat.open');
   });
 
+  test('fallback ranking prefers submit-like chat command over cloud session repository command', () => {
+    const participant = buildDefaultCopilotParticipant();
+    const candidates = [
+      buildCommandCandidate('github.copilot.chat.cloudSessions.openRepository', 'Open Repository in Cloud Session', 'Chat', 'runtime'),
+      buildCommandCandidate('github.copilot.chat.submitPrompt', 'Submit Prompt', 'Chat', 'runtime'),
+    ];
+
+    const traces = [];
+    const resolved = resolveCommandForParticipant(participant, candidates, {
+      resolutionContext: {
+        targetMode: 'generic',
+        routedPrompt: 'Please plan a simple REST API for a blog with endpoints for users and posts.',
+      },
+      onDebug: (payload) => traces.push(payload),
+    });
+
+    assert.strictEqual(resolved.linkReason, 'primary-preference');
+    assert.strictEqual(resolved.linkedCommandId, 'github.copilot.chat.submitPrompt');
+    assert.strictEqual(traces.length, 1);
+    assert.strictEqual(traces[0].preferredCommand, 'github.copilot.chat.submitPrompt');
+  });
+
   test('explicit hint still overrides preferred command policy', () => {
     const participant = buildDefaultCopilotParticipant({
       command: 'github.copilot.chat.applyCopilotCLIAgentSessionChanges',
