@@ -410,7 +410,7 @@ function resolveCommandForParticipant(participant, commandCandidates, options) {
   const targetMode = typeof resolutionContext.targetMode === 'string' && resolutionContext.targetMode
     ? resolutionContext.targetMode
     : 'explicit';
-  const preferredCommandId = getPrimaryCommandPreferences().get(participantFamilyKey) || '';
+  const preferredCommandId = getPreferredCommandForFamily(participantFamilyKey, commandCandidates);
   const availableCandidates = (commandCandidates || []).map((candidate) => candidate.id);
 
   const scored = (commandCandidates || []).map((candidate) => ({
@@ -540,8 +540,59 @@ function getPrimaryVariantRank(participantId) {
 }
 function getPrimaryCommandPreferences() {
   return new Map([
-    ['github.copilot', 'github.copilot.chat.ask'],
+    ['github.copilot', [
+      'github.copilot.chat.ask',
+      'github.copilot.chat.open',
+      'github.copilot.chat.send',
+      'github.copilot.chat.new',
+    ]],
   ]);
+}
+
+function getPreferredCommandForFamily(familyKey, commandCandidates) {
+  const preferenceMap = getPrimaryCommandPreferences();
+  const preferredIds = preferenceMap.get(familyKey);
+  const availableById = new Set((commandCandidates || []).map((candidate) => candidate.id));
+
+  if (Array.isArray(preferredIds)) {
+    for (const id of preferredIds) {
+      if (typeof id !== 'string' || !id) continue;
+      if (availableById.has(id)) return id;
+    }
+  } else if (typeof preferredIds === 'string' && preferredIds) {
+    if (availableById.has(preferredIds)) return preferredIds;
+  }
+
+  const familyPrefix = `${String(familyKey || '').trim()}.`;
+  if (!familyPrefix || familyPrefix === '.') return '';
+
+  const familyCandidates = (commandCandidates || []).filter((candidate) => String(candidate.id || '').startsWith(familyPrefix));
+  if (familyCandidates.length === 0) return '';
+
+  const ranked = familyCandidates
+    .map((candidate) => {
+      const idTokens = Array.isArray(candidate.idTokens) ? candidate.idTokens : tokenize(candidate.id);
+      const hasOperationalToken = idTokens.some((token) => OPERATIONAL_INTENT_TOKENS.has(token));
+
+      let score = 0;
+      if (idTokens.includes('chat')) score += 60;
+      if (idTokens.includes('ask')) score += 120;
+      if (idTokens.includes('open')) score += 50;
+      if (idTokens.includes('send')) score += 45;
+      if (idTokens.includes('new')) score += 35;
+      if (hasOperationalToken) score -= 80;
+
+      return {
+        id: candidate.id,
+        score,
+      };
+    })
+    .sort((left, right) => {
+      if (right.score !== left.score) return right.score - left.score;
+      return left.id.localeCompare(right.id);
+    });
+
+  return ranked[0] ? ranked[0].id : '';
 }
 
 function classifyPromptIntent(promptText) {
@@ -845,6 +896,31 @@ function activate(extensionContext) {
       let runtimeCommandIds = [];
       try {
         runtimeCommandIds = await vscode.commands.getCommands(true);
+
+        const sortedRuntimeCommandIds = [...runtimeCommandIds]
+          .map((commandId) => String(commandId || '').trim())
+          .filter(Boolean)
+          .sort((left, right) => left.localeCompare(right));
+
+        const copilotRuntimeCommandIds = sortedRuntimeCommandIds
+          .filter((commandId) => commandId.startsWith('github.copilot.'));
+
+        debugLog({
+          type: 'runtime-command-enumeration',
+          reason,
+          commandCount: sortedRuntimeCommandIds.length,
+          commands: sortedRuntimeCommandIds,
+        });
+
+        debugLog({
+          type: 'runtime-command-enumeration-copilot',
+          reason,
+          commandCount: copilotRuntimeCommandIds.length,
+          commands: copilotRuntimeCommandIds,
+        });
+
+        log(`[debug] runtime-command-enumeration count=${sortedRuntimeCommandIds.length}`);
+        log(`[debug] runtime-command-enumeration-copilot count=${copilotRuntimeCommandIds.length}`);
       } catch (error) {
         const message = error && error.message ? error.message : String(error);
         log(`Unable to read runtime command catalog: ${message}`);

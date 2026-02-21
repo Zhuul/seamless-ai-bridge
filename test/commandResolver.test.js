@@ -160,6 +160,28 @@ suite('Command Resolver', () => {
     assert.strictEqual(trace.resolutionReason, 'primary-preference');
   });
 
+  test('generic copilot prompt chooses next preferred chat command when ask is missing', () => {
+    const participant = buildDefaultCopilotParticipant();
+    const candidates = [
+      buildCommandCandidate('github.copilot.chat.applyCopilotCLIAgentSessionChanges', 'Apply CLI Agent Session Changes', 'Chat', 'contributed'),
+      buildCommandCandidate('github.copilot.chat.open', 'Open Chat', 'Chat', 'runtime'),
+    ];
+
+    const traces = [];
+    const resolved = resolveCommandForParticipant(participant, candidates, {
+      resolutionContext: {
+        targetMode: 'generic',
+        routedPrompt: 'Please plan a simple REST API for a blog with endpoints for users and posts.',
+      },
+      onDebug: (payload) => traces.push(payload),
+    });
+
+    assert.strictEqual(resolved.linkReason, 'primary-preference');
+    assert.strictEqual(resolved.linkedCommandId, 'github.copilot.chat.open');
+    assert.strictEqual(traces.length, 1);
+    assert.strictEqual(traces[0].preferredCommand, 'github.copilot.chat.open');
+  });
+
   test('explicit hint still overrides preferred command policy', () => {
     const participant = buildDefaultCopilotParticipant({
       command: 'github.copilot.chat.applyCopilotCLIAgentSessionChanges',
