@@ -42,6 +42,59 @@
           "markdownDescription": "Experimental and unstable. When enabled, @bridge may attempt best-effort cross-participant command invocation before automatically falling back to the local bridge provider.",
           "default": false
         },
+        "seamlessAiBridge.personas": {
+          "type": "array",
+          "markdownDescription": "Configurable personas for @bridge. Each persona can be addressed as `@<alias>` and uses its own Copilot model selector and conversation history.",
+          "default": [],
+          "items": {
+            "type": "object",
+            "required": [
+              "alias"
+            ],
+            "properties": {
+              "alias": {
+                "type": "string",
+                "description": "Persona alias used in chat, for example `planner` for `@planner`."
+              },
+              "name": {
+                "type": "string",
+                "description": "Optional display name for the persona."
+              },
+              "enabled": {
+                "type": "boolean",
+                "description": "Enable or disable this persona.",
+                "default": true
+              },
+              "provider": {
+                "type": "string",
+                "description": "Reserved for future multi-provider support. V4 supports `copilot` only.",
+                "default": "copilot"
+              },
+              "modelSelector": {
+                "type": "object",
+                "description": "Copilot model selector fields used with vscode.lm.selectChatModels.",
+                "properties": {
+                  "vendor": {
+                    "type": "string",
+                    "description": "Model vendor. V4 enforces `copilot`."
+                  },
+                  "id": {
+                    "type": "string",
+                    "description": "Specific model ID if known."
+                  },
+                  "family": {
+                    "type": "string",
+                    "description": "Model family, for example `gpt-4o`."
+                  },
+                  "version": {
+                    "type": "string",
+                    "description": "Optional model version."
+                  }
+                }
+              }
+            }
+          }
+        },
         "seamless-ai-bridge.debug.enabled": {
           "type": "boolean",
           "description": "Enable detailed debug logging to the Seamless AI Bridge output channel.",

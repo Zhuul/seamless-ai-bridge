@@ -8,6 +8,8 @@ const coderProvider = require('./coderProvider');
 const BLACKLIST_TOKENS = new Set(['test', 'debug', 'internal', 'sample']);
 const CORE_CHAT_TOKENS = new Set(['copilot', 'codex']);
 const OPERATIONAL_INTENT_TOKENS = new Set(['apply', 'replay', 'session', 'enable', 'disable']);
+const PERSONA_SESSION_STORAGE_KEY = 'seamlessAiBridge.personaSessions.v1';
+const PERSONA_MAX_TURNS = 40;
 
 function runShell(command, cwd, token) {
   return new Promise((resolve) => {
@@ -46,6 +48,210 @@ function tokenize(value) {
 
   const tokens = input.match(/[a-z0-9]+/g) || [];
   return tokens.filter((token) => token.length >= 2);
+}
+
+function normalizePersonaAlias(value) {
+  return String(value || '')
+    .trim()
+    .replace(/^@/, '')
+    .toLowerCase();
+}
+
+function sanitizeModelSelector(value) {
+  if (!value || typeof value !== 'object') return undefined;
+
+  const selector = {};
+  const id = typeof value.id === 'string' ? value.id.trim() : '';
+  const family = typeof value.family === 'string' ? value.family.trim() : '';
+  const version = typeof value.version === 'string' ? value.version.trim() : '';
+  const vendor = typeof value.vendor === 'string' ? value.vendor.trim().toLowerCase() : '';
+
+  selector.vendor = 'copilot';
+  if (id) selector.id = id;
+  if (family) selector.family = family;
+  if (version) selector.version = version;
+
+  if (vendor && vendor !== 'copilot') return undefined;
+  return selector;
+}
+
+function readConfiguredPersonas(rawPersonas) {
+  const personas = new Map();
+  const source = Array.isArray(rawPersonas) ? rawPersonas : [];
+
+  for (const entry of source) {
+    if (!entry || typeof entry !== 'object') continue;
+    if (entry.enabled === false) continue;
+
+    const alias = normalizePersonaAlias(entry.alias);
+    if (!alias) continue;
+
+    const provider = typeof entry.provider === 'string' && entry.provider.trim()
+      ? entry.provider.trim().toLowerCase()
+      : 'copilot';
+    if (provider !== 'copilot') continue;
+
+    personas.set(alias, {
+      alias,
+      name: typeof entry.name === 'string' ? entry.name.trim() : '',
+      provider,
+      modelSelector: sanitizeModelSelector(entry.modelSelector),
+      metadata: {},
+    });
+  }
+
+  return personas;
+}
+
+function parsePersonaPrompt(prompt, personas) {
+  const text = String(prompt || '').trim();
+  const map = personas instanceof Map ? personas : new Map();
+  const routeMatch = /^@([A-Za-z0-9._-]+)\s*([\s\S]*)$/.exec(text);
+
+  if (!routeMatch) {
+    return {
+      persona: undefined,
+      routedPrompt: text,
+      usedPersonaPrefix: false,
+    };
+  }
+
+  const alias = normalizePersonaAlias(routeMatch[1]);
+  const persona = map.get(alias);
+  if (!persona) {
+    return {
+      persona: undefined,
+      routedPrompt: text,
+      usedPersonaPrefix: false,
+    };
+  }
+
+  const routedPrompt = String(routeMatch[2] || '').trim();
+  return {
+    persona,
+    routedPrompt,
+    usedPersonaPrefix: true,
+  };
+}
+
+function createSessionManager(extensionContext) {
+  const rawState = extensionContext.globalState.get(PERSONA_SESSION_STORAGE_KEY, {});
+  const sessions = new Map();
+
+  const normalizeTurns = (turns) => {
+    if (!Array.isArray(turns)) return [];
+    return turns
+      .filter((turn) => turn && typeof turn === 'object')
+      .map((turn) => {
+        const role = turn.role === 'assistant' ? 'assistant' : 'user';
+        const content = typeof turn.content === 'string' ? turn.content : '';
+        return { role, content };
+      })
+      .filter((turn) => turn.content)
+      .slice(-PERSONA_MAX_TURNS);
+  };
+
+  if (rawState && typeof rawState === 'object') {
+    for (const [alias, turns] of Object.entries(rawState)) {
+      const key = normalizePersonaAlias(alias);
+      if (!key) continue;
+      sessions.set(key, normalizeTurns(turns));
+    }
+  }
+
+  const persist = async () => {
+    const serializable = {};
+    for (const [alias, turns] of sessions.entries()) {
+      serializable[alias] = normalizeTurns(turns);
+    }
+    await extensionContext.globalState.update(PERSONA_SESSION_STORAGE_KEY, serializable);
+  };
+
+  const getHistory = (alias) => {
+    const key = normalizePersonaAlias(alias);
+    if (!key) return [];
+    return [...(sessions.get(key) || [])];
+  };
+
+  const appendTurns = async (alias, turns) => {
+    const key = normalizePersonaAlias(alias);
+    if (!key) return;
+    const previous = sessions.get(key) || [];
+    const next = normalizeTurns([...previous, ...(Array.isArray(turns) ? turns : [])]);
+    sessions.set(key, next);
+    await persist();
+  };
+
+  const clear = async (alias) => {
+    const key = normalizePersonaAlias(alias);
+    if (!key) return;
+    sessions.delete(key);
+    await persist();
+  };
+
+  return {
+    getHistory,
+    appendTurns,
+    clear,
+  };
+}
+
+async function resolvePersonaModel(baseModel, persona, debugLog) {
+  const selector = persona && persona.modelSelector;
+  if (!selector || typeof selector !== 'object') {
+    return baseModel;
+  }
+
+  const copilotSelector = {
+    ...selector,
+    vendor: 'copilot',
+  };
+
+  try {
+    const models = await vscode.lm.selectChatModels(copilotSelector);
+    if (Array.isArray(models) && models.length > 0) {
+      return models[0];
+    }
+
+    if (typeof debugLog === 'function') {
+      debugLog({
+        type: 'persona-model-resolution',
+        alias: persona.alias,
+        selected: false,
+        reason: 'no-match',
+        selector: copilotSelector,
+      });
+    }
+  } catch (error) {
+    if (typeof debugLog === 'function') {
+      debugLog({
+        type: 'persona-model-resolution',
+        alias: persona.alias,
+        selected: false,
+        reason: 'error',
+        selector: copilotSelector,
+        message: error && error.message ? error.message : String(error),
+      });
+    }
+  }
+
+  return baseModel;
+}
+
+function toLanguageModelMessages(historyTurns, currentPrompt) {
+  const messages = [];
+
+  for (const turn of historyTurns || []) {
+    if (!turn || typeof turn !== 'object' || typeof turn.content !== 'string' || !turn.content) continue;
+    if (turn.role === 'assistant') {
+      messages.push(vscode.LanguageModelChatMessage.Assistant(turn.content));
+    } else {
+      messages.push(vscode.LanguageModelChatMessage.User(turn.content));
+    }
+  }
+
+  messages.push(vscode.LanguageModelChatMessage.User(currentPrompt));
+  return messages;
 }
 
 function unique(items) {
@@ -888,6 +1094,7 @@ function activate(extensionContext) {
 
   let participantRegistry = new Map();
   let commandCatalog = [];
+  const personaSessionManager = createSessionManager(extensionContext);
   let refreshInFlight;
   let registryReady = false;
   let lastExperimentalMode;
@@ -1342,6 +1549,8 @@ function activate(extensionContext) {
       phase = 'load-config';
       const bridgeConfig = vscode.workspace.getConfiguration('seamlessAiBridge');
       const isExperimentalMode = Boolean(bridgeConfig.get('experimental.enableCrossParticipantChat', false));
+      const configuredPersonas = readConfiguredPersonas(bridgeConfig.get('personas', []));
+      const personaRoute = parsePersonaPrompt(prompt, configuredPersonas);
 
       debugLog({
         type: 'provide-response-trace',
@@ -1349,7 +1558,73 @@ function activate(extensionContext) {
         phase,
         isExperimentalMode,
         registryReady,
+        configuredPersonas: configuredPersonas.size,
+        personaAlias: personaRoute.persona ? personaRoute.persona.alias : '',
       });
+
+      if (personaRoute.persona) {
+        const persona = personaRoute.persona;
+        const personaPrompt = personaRoute.routedPrompt;
+
+        phase = 'persona-route';
+        debugLog({
+          type: 'provide-response-trace',
+          requestId,
+          phase,
+          alias: persona.alias,
+          promptLength: personaPrompt.length,
+          hasModelSelector: Boolean(persona.modelSelector),
+        });
+
+        if (!personaPrompt) {
+          response.markdown(`Persona @${persona.alias} needs a prompt. Use \`@${persona.alias} <message>\`.`);
+          return;
+        }
+
+        if (personaPrompt === '/reset') {
+          phase = 'persona-reset';
+          await personaSessionManager.clear(persona.alias);
+          debugLog({
+            type: 'persona-session-reset',
+            requestId,
+            alias: persona.alias,
+          });
+          response.markdown(`Reset conversation history for @${persona.alias}.`);
+          return;
+        }
+
+        phase = 'persona-model-request';
+        const historyBefore = personaSessionManager.getHistory(persona.alias);
+        const model = await resolvePersonaModel(request.model, persona, debugLog);
+        const lmMessages = toLanguageModelMessages(historyBefore, personaPrompt);
+        const lmResponse = await model.sendRequest(lmMessages, {}, token);
+
+        let assistantText = '';
+        for await (const fragment of lmResponse.text) {
+          const text = typeof fragment === 'string' ? fragment : '';
+          if (!text) continue;
+          assistantText += text;
+          response.markdown(text);
+        }
+
+        await personaSessionManager.appendTurns(persona.alias, [
+          { role: 'user', content: personaPrompt },
+          { role: 'assistant', content: assistantText },
+        ]);
+
+        const historyAfter = personaSessionManager.getHistory(persona.alias);
+        debugLog({
+          type: 'persona-session-update',
+          requestId,
+          alias: persona.alias,
+          turnsBefore: historyBefore.length,
+          turnsAfter: historyAfter.length,
+          promptLength: personaPrompt.length,
+          responseLength: assistantText.length,
+          modelSelector: persona.modelSelector || null,
+        });
+        return;
+      }
 
       if (!registryReady) {
         phase = 'refresh-first-request';
@@ -1370,6 +1645,7 @@ function activate(extensionContext) {
       const tracked = createTrackedResponse(response);
       const providerContext = {
         userPrompt: prompt,
+        personaAlias: '',
       };
 
       const providerOptions = {
@@ -1502,5 +1778,9 @@ module.exports = {
     containsOrderedTokenSequence,
     buildContributedCommandCatalog,
     mergeRuntimeCommandCatalog,
+    normalizePersonaAlias,
+    readConfiguredPersonas,
+    parsePersonaPrompt,
+    toLanguageModelMessages,
   },
 };
