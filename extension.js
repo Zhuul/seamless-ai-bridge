@@ -672,9 +672,8 @@ function activate(extensionContext) {
     output.appendLine(`[${new Date().toISOString()}] ${message}`);
   }
 
-  const debugEnabled = process.env.SEAMLESS_AI_BRIDGE_DEBUG === '1';
-
   function debugLog(payload) {
+    const debugEnabled = Boolean(vscode.workspace.getConfiguration('seamless-ai-bridge').get('debug.enabled', false));
     if (!debugEnabled) return;
     if (typeof payload === 'string') {
       log(`[debug] ${payload}`);
