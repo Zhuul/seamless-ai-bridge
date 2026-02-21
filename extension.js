@@ -541,6 +541,7 @@ function getPrimaryVariantRank(participantId) {
 function getPrimaryCommandPreferences() {
   return new Map([
     ['github.copilot', [
+      'github.copilot.chat.submit',
       'github.copilot.chat.ask',
       'github.copilot.chat.open',
       'github.copilot.chat.send',
