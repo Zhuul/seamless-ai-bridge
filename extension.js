@@ -4,12 +4,21 @@ const path = require('path');
 const readline = require('readline');
 const plannerProvider = require('./plannerProvider');
 const coderProvider = require('./coderProvider');
+const {
+  readConfiguredAgents,
+  parseAgentPrompt,
+  normalizeAgentAlias,
+  getDangerousCapabilities,
+  createSessionManager: createAgentSessionManager,
+} = require('./agentEngine');
+const { CopilotProvider } = require('./providers/copilotProvider');
+const { CodexProvider } = require('./providers/codexProvider');
+const { AgentTreeProvider } = require('./agentTreeProvider');
+const { AgentManagerViewProvider } = require('./agentManagerViewProvider');
 
 const BLACKLIST_TOKENS = new Set(['test', 'debug', 'internal', 'sample']);
 const CORE_CHAT_TOKENS = new Set(['copilot', 'codex']);
 const OPERATIONAL_INTENT_TOKENS = new Set(['apply', 'replay', 'session', 'enable', 'disable']);
-const PERSONA_SESSION_STORAGE_KEY = 'seamlessAiBridge.personaSessions.v1';
-const PERSONA_MAX_TURNS = 40;
 
 function runShell(command, cwd, token) {
   return new Promise((resolve) => {
@@ -141,110 +150,6 @@ function parsePersonaPrompt(prompt, personas) {
     routedPrompt,
     usedPersonaPrefix: true,
   };
-}
-
-function createSessionManager(extensionContext) {
-  const rawState = extensionContext.globalState.get(PERSONA_SESSION_STORAGE_KEY, {});
-  const sessions = new Map();
-
-  const normalizeTurns = (turns) => {
-    if (!Array.isArray(turns)) return [];
-    return turns
-      .filter((turn) => turn && typeof turn === 'object')
-      .map((turn) => {
-        const role = turn.role === 'assistant' ? 'assistant' : 'user';
-        const content = typeof turn.content === 'string' ? turn.content : '';
-        return { role, content };
-      })
-      .filter((turn) => turn.content)
-      .slice(-PERSONA_MAX_TURNS);
-  };
-
-  if (rawState && typeof rawState === 'object') {
-    for (const [alias, turns] of Object.entries(rawState)) {
-      const key = normalizePersonaAlias(alias);
-      if (!key) continue;
-      sessions.set(key, normalizeTurns(turns));
-    }
-  }
-
-  const persist = async () => {
-    const serializable = {};
-    for (const [alias, turns] of sessions.entries()) {
-      serializable[alias] = normalizeTurns(turns);
-    }
-    await extensionContext.globalState.update(PERSONA_SESSION_STORAGE_KEY, serializable);
-  };
-
-  const getHistory = (alias) => {
-    const key = normalizePersonaAlias(alias);
-    if (!key) return [];
-    return [...(sessions.get(key) || [])];
-  };
-
-  const appendTurns = async (alias, turns) => {
-    const key = normalizePersonaAlias(alias);
-    if (!key) return;
-    const previous = sessions.get(key) || [];
-    const next = normalizeTurns([...previous, ...(Array.isArray(turns) ? turns : [])]);
-    sessions.set(key, next);
-    await persist();
-  };
-
-  const clear = async (alias) => {
-    const key = normalizePersonaAlias(alias);
-    if (!key) return;
-    sessions.delete(key);
-    await persist();
-  };
-
-  return {
-    getHistory,
-    appendTurns,
-    clear,
-  };
-}
-
-async function resolvePersonaModel(baseModel, persona, debugLog) {
-  const selector = persona && persona.modelSelector;
-  if (!selector || typeof selector !== 'object') {
-    return baseModel;
-  }
-
-  const copilotSelector = {
-    ...selector,
-    vendor: 'copilot',
-  };
-
-  try {
-    const models = await vscode.lm.selectChatModels(copilotSelector);
-    if (Array.isArray(models) && models.length > 0) {
-      return models[0];
-    }
-
-    if (typeof debugLog === 'function') {
-      debugLog({
-        type: 'persona-model-resolution',
-        alias: persona.alias,
-        selected: false,
-        reason: 'no-match',
-        selector: copilotSelector,
-      });
-    }
-  } catch (error) {
-    if (typeof debugLog === 'function') {
-      debugLog({
-        type: 'persona-model-resolution',
-        alias: persona.alias,
-        selected: false,
-        reason: 'error',
-        selector: copilotSelector,
-        message: error && error.message ? error.message : String(error),
-      });
-    }
-  }
-
-  return baseModel;
 }
 
 function toLanguageModelMessages(historyTurns, currentPrompt) {
@@ -1105,7 +1010,14 @@ function activate(extensionContext) {
 
   let participantRegistry = new Map();
   let commandCatalog = [];
-  const personaSessionManager = createSessionManager(extensionContext);
+  const workspaceKey = (vscode.workspace.workspaceFolders || [])
+    .map((folder) => folder.uri.toString())
+    .join(';') || 'global';
+  const agentSessionManager = createAgentSessionManager(extensionContext, workspaceKey);
+  const dangerousCapabilities = getDangerousCapabilities();
+  let providerRegistry = new Map();
+  let agentTreeProvider;
+  let agentManagerViewProvider;
   let refreshInFlight;
   let registryReady = false;
   let lastExperimentalMode;
@@ -1321,6 +1233,101 @@ function activate(extensionContext) {
     };
   }
 
+  function getDefaultCapabilities() {
+    const bridgeConfig = vscode.workspace.getConfiguration('seamlessAiBridge');
+    const configured = bridgeConfig.get('defaultCapabilities', ['@workspace']);
+    return Array.isArray(configured)
+      ? configured.filter((entry) => typeof entry === 'string' && entry.trim()).map((entry) => entry.trim())
+      : ['@workspace'];
+  }
+
+  function getAgentsMap() {
+    const bridgeConfig = vscode.workspace.getConfiguration('seamlessAiBridge');
+    return readConfiguredAgents(bridgeConfig.get('personas', []), {
+      defaultCapabilities: getDefaultCapabilities(),
+    });
+  }
+
+  function getAgentsArray() {
+    return Array.from(getAgentsMap().values()).sort((left, right) => left.alias.localeCompare(right.alias));
+  }
+
+  async function saveAgent(agentInput) {
+    const bridgeConfig = vscode.workspace.getConfiguration('seamlessAiBridge');
+    const current = bridgeConfig.get('personas', []);
+    const personas = Array.isArray(current) ? [...current] : [];
+
+    const alias = normalizeAgentAlias(agentInput && agentInput.alias);
+    if (!alias) {
+      throw new Error('Agent alias is required.');
+    }
+
+    const provider = typeof (agentInput && agentInput.provider) === 'string' && agentInput.provider.trim()
+      ? agentInput.provider.trim().toLowerCase()
+      : 'copilot';
+    const model = typeof (agentInput && agentInput.model) === 'string' ? agentInput.model.trim() : '';
+    const historyPersistence = Boolean(agentInput ? agentInput.historyPersistence !== false : true);
+    const capabilities = Array.isArray(agentInput && agentInput.capabilities)
+      ? Array.from(new Set(agentInput.capabilities.filter((entry) => typeof entry === 'string' && entry.trim()).map((entry) => entry.trim())))
+      : 'default';
+
+    const nextAgent = {
+      alias,
+      provider,
+      historyPersistence,
+      capabilities,
+      enabled: true,
+    };
+
+    if (model) {
+      nextAgent.model = model;
+    }
+
+    const index = personas.findIndex((entry) => normalizeAgentAlias(entry && entry.alias) === alias);
+    if (index >= 0) {
+      personas[index] = {
+        ...personas[index],
+        ...nextAgent,
+      };
+    } else {
+      personas.push(nextAgent);
+    }
+
+    await bridgeConfig.update('personas', personas, vscode.ConfigurationTarget.Global);
+  }
+
+  async function deleteAgent(alias) {
+    const targetAlias = normalizeAgentAlias(alias);
+    if (!targetAlias) return;
+
+    const bridgeConfig = vscode.workspace.getConfiguration('seamlessAiBridge');
+    const current = bridgeConfig.get('personas', []);
+    const personas = Array.isArray(current) ? current : [];
+    const next = personas.filter((entry) => normalizeAgentAlias(entry && entry.alias) !== targetAlias);
+    await bridgeConfig.update('personas', next, vscode.ConfigurationTarget.Global);
+  }
+
+  async function resetAgentHistory(alias) {
+    const targetAlias = normalizeAgentAlias(alias);
+    if (!targetAlias) return;
+    await agentSessionManager.clearAgent(targetAlias);
+  }
+
+  async function listProviderModels(providerId, token) {
+    const provider = providerRegistry.get(providerId);
+    if (!provider) return [];
+    return provider.listModels({}, token);
+  }
+
+  function refreshAgentViews() {
+    if (agentTreeProvider) {
+      agentTreeProvider.refresh();
+    }
+    if (agentManagerViewProvider) {
+      agentManagerViewProvider.notifyStateChanged();
+    }
+  }
+
 
   let bridgeInstance;
 
@@ -1494,11 +1501,197 @@ function activate(extensionContext) {
     }
   }
 
+  async function sendToBridgeText(prompt, callbacks) {
+    const bridge = getBridge();
+    const onToken = callbacks && typeof callbacks.onToken === 'function' ? callbacks.onToken : () => {};
+    const token = callbacks ? callbacks.token : undefined;
+    let text = '';
+
+    await bridge.send(prompt, {
+      markdown(value) {
+        const chunk = String(value || '');
+        if (!chunk) return;
+        text += chunk;
+        onToken(chunk);
+      },
+    }, token);
+
+    return text;
+  }
+
+  providerRegistry = new Map([
+    ['copilot', new CopilotProvider()],
+    ['codex', new CodexProvider({ sendToBridge: sendToBridgeText })],
+  ]);
+
   log('Activating Seamless AI Bridge.');
   refreshParticipantRegistry('activate').catch((error) => {
     const message = error && error.message ? error.message : String(error);
     log(`Initial participant refresh failed: ${message}`);
   });
+
+  agentTreeProvider = new AgentTreeProvider(() => getAgentsArray());
+  extensionContext.subscriptions.push(
+    vscode.window.registerTreeDataProvider('seamlessAiBridge.agentsView', agentTreeProvider),
+  );
+
+  agentManagerViewProvider = new AgentManagerViewProvider({
+    getAgents: () => getAgentsArray(),
+    getDefaultCapabilities: () => getDefaultCapabilities(),
+    listModels: (providerId, token) => listProviderModels(providerId, token),
+    saveAgent: async (agent) => {
+      await saveAgent(agent);
+      refreshAgentViews();
+    },
+    deleteAgent: async (alias) => {
+      await deleteAgent(alias);
+      refreshAgentViews();
+    },
+    resetAgentHistory: async (alias) => {
+      await resetAgentHistory(alias);
+      refreshAgentViews();
+    },
+  });
+
+  extensionContext.subscriptions.push(
+    vscode.window.registerWebviewViewProvider('seamlessAiBridge.agentManagerView', agentManagerViewProvider),
+  );
+
+  async function pickAgentAlias(placeHolder) {
+    const agents = getAgentsArray();
+    if (agents.length === 0) {
+      vscode.window.showInformationMessage('No agents configured.');
+      return '';
+    }
+
+    const choice = await vscode.window.showQuickPick(
+      agents.map((agent) => ({
+        label: `@${agent.alias}`,
+        description: `${agent.provider}:${agent.model || 'auto'}`,
+        agent,
+      })),
+      { placeHolder },
+    );
+
+    return choice ? choice.agent.alias : '';
+  }
+
+  async function promptAgentFields(existing) {
+    const current = existing || {};
+    const alias = normalizeAgentAlias(await vscode.window.showInputBox({
+      prompt: 'Agent alias',
+      value: current.alias || '',
+      validateInput: (value) => (normalizeAgentAlias(value) ? undefined : 'Alias is required.'),
+    }));
+    if (!alias) return undefined;
+
+    const providerPick = await vscode.window.showQuickPick([
+      { label: 'copilot', description: 'Use VS Code Copilot language model provider' },
+      { label: 'codex', description: 'Use local Codex bridge provider' },
+    ], {
+      placeHolder: 'Select provider',
+    });
+    if (!providerPick) return undefined;
+
+    const model = await vscode.window.showInputBox({
+      prompt: 'Model (optional, leave empty for auto)',
+      value: current.model || '',
+    });
+    if (model === undefined) return undefined;
+
+    const historyPick = await vscode.window.showQuickPick([
+      { label: 'Persistent history', value: true },
+      { label: 'Stateless', value: false },
+    ], {
+      placeHolder: 'History mode',
+    });
+    if (!historyPick) return undefined;
+
+    const capabilityMode = await vscode.window.showQuickPick([
+      { label: 'default', description: 'Use global defaultCapabilities' },
+      { label: 'custom', description: 'Specify per-agent capabilities' },
+    ], {
+      placeHolder: 'Capability mode',
+    });
+    if (!capabilityMode) return undefined;
+
+    let capabilities = 'default';
+    if (capabilityMode.label === 'custom') {
+      const selected = await vscode.window.showQuickPick([
+        { label: '@workspace' },
+        { label: '@vscode' },
+        { label: '@terminal' },
+      ], {
+        canPickMany: true,
+        placeHolder: 'Select allowed capabilities',
+      });
+
+      if (!selected) return undefined;
+      capabilities = selected.map((item) => item.label);
+    }
+
+    return {
+      alias,
+      provider: providerPick.label,
+      model: String(model || '').trim(),
+      historyPersistence: historyPick.value,
+      capabilities,
+    };
+  }
+
+  extensionContext.subscriptions.push(
+    vscode.commands.registerCommand('seamlessAiBridge.refreshAgents', () => {
+      refreshAgentViews();
+    }),
+    vscode.commands.registerCommand('seamlessAiBridge.addAgent', async () => {
+      const next = await promptAgentFields();
+      if (!next) return;
+      await saveAgent(next);
+      refreshAgentViews();
+    }),
+    vscode.commands.registerCommand('seamlessAiBridge.editAgent', async (item) => {
+      const existingAlias = item && item.agent ? normalizeAgentAlias(item.agent.alias) : '';
+      const alias = existingAlias || await pickAgentAlias('Select an agent to edit');
+      if (!alias) return;
+
+      const existing = getAgentsMap().get(alias);
+      if (!existing) return;
+
+      const next = await promptAgentFields(existing);
+      if (!next) return;
+
+      if (next.alias !== alias) {
+        await deleteAgent(alias);
+      }
+      await saveAgent(next);
+      refreshAgentViews();
+    }),
+    vscode.commands.registerCommand('seamlessAiBridge.removeAgent', async (item) => {
+      const existingAlias = item && item.agent ? normalizeAgentAlias(item.agent.alias) : '';
+      const alias = existingAlias || await pickAgentAlias('Select an agent to remove');
+      if (!alias) return;
+      await deleteAgent(alias);
+      await resetAgentHistory(alias);
+      refreshAgentViews();
+    }),
+    vscode.commands.registerCommand('seamlessAiBridge.resetAgentHistory', async (item) => {
+      const existingAlias = item && item.agent ? normalizeAgentAlias(item.agent.alias) : '';
+      const alias = existingAlias || await pickAgentAlias('Select an agent history to reset');
+      if (!alias) return;
+      await resetAgentHistory(alias);
+      refreshAgentViews();
+      vscode.window.showInformationMessage(`Reset history for @${alias}.`);
+    }),
+  );
+
+  extensionContext.subscriptions.push(vscode.workspace.onDidChangeConfiguration((event) => {
+    if (
+      event.affectsConfiguration('seamlessAiBridge.personas')
+      || event.affectsConfiguration('seamlessAiBridge.defaultCapabilities')
+    ) {
+      refreshAgentViews();
+    }
+  }));
 
   async function handleRequest(request, _chatContext, response, token) {
     const requestId = Math.random().toString(36).slice(2);
@@ -1560,8 +1753,9 @@ function activate(extensionContext) {
       phase = 'load-config';
       const bridgeConfig = vscode.workspace.getConfiguration('seamlessAiBridge');
       const isExperimentalMode = Boolean(bridgeConfig.get('experimental.enableCrossParticipantChat', false));
-      const configuredPersonas = readConfiguredPersonas(bridgeConfig.get('personas', []));
-      const personaRoute = parsePersonaPrompt(prompt, configuredPersonas);
+      const defaultCapabilities = getDefaultCapabilities();
+      const configuredAgents = readConfiguredAgents(bridgeConfig.get('personas', []), { defaultCapabilities });
+      const agentRoute = parseAgentPrompt(prompt, configuredAgents);
 
       debugLog({
         type: 'provide-response-trace',
@@ -1569,70 +1763,102 @@ function activate(extensionContext) {
         phase,
         isExperimentalMode,
         registryReady,
-        configuredPersonas: configuredPersonas.size,
-        personaAlias: personaRoute.persona ? personaRoute.persona.alias : '',
+        configuredAgents: configuredAgents.size,
+        agentAlias: agentRoute.agent ? agentRoute.agent.alias : '',
       });
 
-      if (personaRoute.persona) {
-        const persona = personaRoute.persona;
-        const personaPrompt = personaRoute.routedPrompt;
+      if (agentRoute.agent) {
+        const agent = agentRoute.agent;
+        const agentPrompt = agentRoute.routedPrompt;
+        const allowedCapabilities = new Set(Array.isArray(agent.capabilities) ? agent.capabilities : defaultCapabilities);
 
-        phase = 'persona-route';
+        phase = 'agent-route';
         debugLog({
           type: 'provide-response-trace',
           requestId,
           phase,
-          alias: persona.alias,
-          promptLength: personaPrompt.length,
-          hasModelSelector: Boolean(persona.modelSelector),
+          alias: agent.alias,
+          promptLength: agentPrompt.length,
+          provider: agent.provider,
+          model: agent.model || '',
+          historyPersistence: Boolean(agent.historyPersistence),
+          capabilities: Array.from(allowedCapabilities),
         });
 
-        if (!personaPrompt) {
-          response.markdown(`Persona @${persona.alias} needs a prompt. Use \`@${persona.alias} <message>\`.`);
+        if (!agentPrompt) {
+          response.markdown(`Agent @${agent.alias} needs a prompt. Use \`@${agent.alias} <message>\`.`);
           return;
         }
 
-        if (personaPrompt === '/reset') {
-          phase = 'persona-reset';
-          await personaSessionManager.clear(persona.alias);
+        if (agentPrompt === '/reset') {
+          const allowLegacyReset = Boolean(bridgeConfig.get('allowLegacyResetCommand', false));
+          if (!allowLegacyReset) {
+            response.markdown('Legacy in-chat reset is disabled. Use Agent Manager or `Seamless AI Bridge: Reset Agent History`.');
+            return;
+          }
+
+          phase = 'agent-reset';
+          await agentSessionManager.clearAgent(agent.alias);
           debugLog({
-            type: 'persona-session-reset',
+            type: 'agent-session-reset',
             requestId,
-            alias: persona.alias,
+            alias: agent.alias,
           });
-          response.markdown(`Reset conversation history for @${persona.alias}.`);
+          response.markdown(`Reset conversation history for @${agent.alias}.`);
           return;
         }
 
-        phase = 'persona-model-request';
-        const historyBefore = personaSessionManager.getHistory(persona.alias);
-        const model = await resolvePersonaModel(request.model, persona, debugLog);
-        const lmMessages = toLanguageModelMessages(historyBefore, personaPrompt);
-        const lmResponse = await model.sendRequest(lmMessages, {}, token);
-
-        let assistantText = '';
-        for await (const fragment of lmResponse.text) {
-          const text = typeof fragment === 'string' ? fragment : '';
-          if (!text) continue;
-          assistantText += text;
-          response.markdown(text);
+        if (dangerousCapabilities.has('@terminal') && agentPrompt.includes('@terminal') && !allowedCapabilities.has('@terminal')) {
+          phase = 'agent-capability-block';
+          response.markdown(`@${agent.alias} is not allowed to use @terminal. Enable it in Agent Manager capabilities.`);
+          debugLog({
+            type: 'agent-capability-block',
+            requestId,
+            alias: agent.alias,
+            capability: '@terminal',
+          });
+          return;
         }
 
-        await personaSessionManager.appendTurns(persona.alias, [
-          { role: 'user', content: personaPrompt },
-          { role: 'assistant', content: assistantText },
-        ]);
+        phase = 'agent-provider-request';
+        response.markdown(`**@${agent.alias}**\n\n`);
+        const provider = providerRegistry.get(agent.provider) || providerRegistry.get('copilot');
+        const historyBefore = agent.historyPersistence ? agentSessionManager.getHistory(agent) : [];
 
-        const historyAfter = personaSessionManager.getHistory(persona.alias);
+        const result = await provider.send({
+          prompt: agentPrompt,
+          history: historyBefore,
+          model: agent.model,
+          requestModel: request.model,
+          capabilities: Array.from(allowedCapabilities),
+          agentAlias: agent.alias,
+        }, {
+          onToken: (text) => response.markdown(text),
+          onDebug: debugLog,
+          token,
+        });
+
+        const assistantText = result && typeof result.text === 'string' ? result.text : '';
+        if (agent.historyPersistence) {
+          await agentSessionManager.appendTurns(agent, [
+            { role: 'user', content: agentPrompt },
+            { role: 'assistant', content: assistantText },
+          ]);
+        }
+
+        const historyAfter = agent.historyPersistence ? agentSessionManager.getHistory(agent) : [];
         debugLog({
-          type: 'persona-session-update',
+          type: 'agent-session-update',
           requestId,
-          alias: persona.alias,
+          alias: agent.alias,
+          provider: agent.provider,
+          model: agent.model || '',
+          historyPersistence: Boolean(agent.historyPersistence),
           turnsBefore: historyBefore.length,
           turnsAfter: historyAfter.length,
-          promptLength: personaPrompt.length,
+          promptLength: agentPrompt.length,
           responseLength: assistantText.length,
-          modelSelector: persona.modelSelector || null,
+          capabilities: Array.from(allowedCapabilities),
         });
         return;
       }
