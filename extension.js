@@ -950,6 +950,31 @@ function activate(extensionContext) {
     };
   }
 
+  function setAgentAuthorPresentation(participant, alias) {
+    if (!participant) return () => {};
+
+    const normalizedAlias = normalizeAgentAlias(alias);
+    const authorLabel = normalizedAlias ? `@${normalizedAlias}` : String(alias || '').trim();
+    if (!authorLabel) return () => {};
+
+    const previousName = participant.name;
+    const previousFullName = participant.fullName;
+
+    try {
+      participant.name = authorLabel;
+      participant.fullName = authorLabel;
+    } catch {
+      return () => {};
+    }
+
+    return () => {
+      try {
+        participant.name = previousName;
+        participant.fullName = previousFullName;
+      } catch {}
+    };
+  }
+
   async function streamForwardResult(result, stream) {
     let emitted = false;
 
@@ -1821,29 +1846,34 @@ function activate(extensionContext) {
         }
 
         phase = 'agent-provider-request';
-        response.markdown(`**@${agent.alias}**\n\n`);
+        const restoreAuthorPresentation = setAgentAuthorPresentation(participant, agent.alias);
         const provider = providerRegistry.get(agent.provider) || providerRegistry.get('copilot');
         const historyBefore = agent.historyPersistence ? agentSessionManager.getHistory(agent) : [];
 
-        const result = await provider.send({
-          prompt: agentPrompt,
-          history: historyBefore,
-          model: agent.model,
-          requestModel: request.model,
-          capabilities: Array.from(allowedCapabilities),
-          agentAlias: agent.alias,
-        }, {
-          onToken: (text) => response.markdown(text),
-          onDebug: debugLog,
-          token,
-        });
+        let assistantText = '';
+        try {
+          const result = await provider.send({
+            prompt: agentPrompt,
+            history: historyBefore,
+            model: agent.model,
+            requestModel: request.model,
+            capabilities: Array.from(allowedCapabilities),
+            agentAlias: agent.alias,
+          }, {
+            onToken: (text) => response.markdown(text),
+            onDebug: debugLog,
+            token,
+          });
 
-        const assistantText = result && typeof result.text === 'string' ? result.text : '';
-        if (agent.historyPersistence) {
-          await agentSessionManager.appendTurns(agent, [
-            { role: 'user', content: agentPrompt },
-            { role: 'assistant', content: assistantText },
-          ]);
+          assistantText = result && typeof result.text === 'string' ? result.text : '';
+          if (agent.historyPersistence) {
+            await agentSessionManager.appendTurns(agent, [
+              { role: 'user', content: agentPrompt },
+              { role: 'assistant', content: assistantText },
+            ]);
+          }
+        } finally {
+          restoreAuthorPresentation();
         }
 
         const historyAfter = agent.historyPersistence ? agentSessionManager.getHistory(agent) : [];

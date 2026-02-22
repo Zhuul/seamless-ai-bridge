@@ -42,11 +42,13 @@
       "seamlessAiBridge": [
         {
           "id": "seamlessAiBridge.agentsView",
-          "name": "Agents"
+          "name": "Agents",
+          "icon": "$(list-tree)"
         },
         {
           "id": "seamlessAiBridge.agentManagerView",
           "name": "Agent Manager",
+          "icon": "$(settings-gear)",
           "type": "webview"
         }
       ]
@@ -119,6 +121,7 @@
         },
         "seamlessAiBridge.personas": {
           "type": "array",
+          "scope": "resource",
           "markdownDescription": "Configurable agents for @bridge. Each agent can be addressed as `@<alias>` and defines provider, model, capabilities, and history behavior.",
           "default": [],
           "items": {

@@ -74,6 +74,11 @@ class AgentManagerViewProvider {
     .warn { color: var(--vscode-editorWarning-foreground); font-size: 12px; margin-top: 6px; display: none; }
     .agent-list { margin-bottom: 12px; }
     .agent-btn { width: 100%; text-align: left; margin-bottom: 4px; }
+    .setting-row { border: 1px solid var(--vscode-panel-border); border-radius: 4px; padding: 8px; }
+    .setting-title { font-weight: 600; margin-bottom: 2px; }
+    .setting-desc { opacity: 0.85; font-size: 12px; margin-bottom: 6px; }
+    .toggle-inline { display: flex; align-items: center; gap: 8px; margin: 0; }
+    .toggle-inline input { width: auto; margin: 0; }
     .actions { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 6px; margin-top: 8px; }
   </style>
 </head>
@@ -108,8 +113,10 @@ class AgentManagerViewProvider {
       <div class="warn" id="terminalWarn">Warning: @terminal allows command execution and is considered dangerous.</div>
     </div>
   </div>
-  <div class="row">
-    <label><input id="historyPersistence" type="checkbox" checked /> History Persistence</label>
+  <div class="row setting-row">
+    <div class="setting-title">History Persistence</div>
+    <div class="setting-desc">Keep multi-turn memory for this agent across requests.</div>
+    <label class="toggle-inline"><input id="historyPersistence" type="checkbox" checked /> Enabled</label>
   </div>
   <div class="actions">
     <button id="newBtn">New</button>
