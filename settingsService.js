@@ -53,35 +53,56 @@ class SettingsService {
     return [...fromFolders, ...workspaceValue];
   }
 
-  hasGlobalPersonasValue() {
+  getGlobalPersonasRaw() {
     const inspect = this.workspace.getConfiguration('seamlessAiBridge').inspect('personas');
-    if (!inspect) return false;
-    if (Array.isArray(inspect.globalValue)) {
-      return inspect.globalValue.length > 0;
+    if (!inspect || !Array.isArray(inspect.globalValue)) {
+      return [];
     }
-    return inspect.globalValue !== undefined;
+    return inspect.globalValue;
   }
 
-  async clearGlobalPersonasValueIfPresent() {
-    if (!this.hasGlobalPersonasValue()) {
-      return false;
+  getLegacyGlobalPersonasRaw() {
+    const inspect = this.workspace.getConfiguration('seamless-ai-bridge').inspect('personas');
+    if (!inspect || !Array.isArray(inspect.globalValue)) {
+      return [];
     }
+    return inspect.globalValue;
+  }
 
-    const bridgeConfig = this.workspace.getConfiguration('seamlessAiBridge');
-    await bridgeConfig.update('personas', undefined, vscode.ConfigurationTarget.Global);
-    return true;
+  getAgentDiagnostics() {
+    const defaultCapabilities = this.getDefaultCapabilities();
+    const workspaceAgentsMap = readConfiguredAgents(this.getWorkspaceScopedPersonasRaw(), { defaultCapabilities });
+    const globalAgentsMap = readConfiguredAgents(this.getGlobalPersonasRaw(), { defaultCapabilities });
+    const legacyGlobalAgentsMap = readConfiguredAgents(this.getLegacyGlobalPersonasRaw(), { defaultCapabilities });
+
+    const workspaceAgents = Array.from(workspaceAgentsMap.values())
+      .sort((left, right) => left.alias.localeCompare(right.alias));
+    const globalAgents = Array.from(globalAgentsMap.values())
+      .sort((left, right) => left.alias.localeCompare(right.alias));
+    const legacyGlobalAgents = Array.from(legacyGlobalAgentsMap.values())
+      .sort((left, right) => left.alias.localeCompare(right.alias));
+
+    const workspaceAliasSet = new Set(workspaceAgents.map((agent) => normalizeAgentAlias(agent.alias)));
+    const globalOnlyAliases = globalAgents
+      .map((agent) => normalizeAgentAlias(agent.alias))
+      .filter((alias) => alias && !workspaceAliasSet.has(alias))
+      .sort();
+
+    return {
+      workspaceAgents,
+      globalAgents,
+      globalOnlyAliases,
+      legacyGlobalAgents,
+    };
   }
 
   getConfiguredAgents() {
-    return readConfiguredAgents(this.getWorkspaceScopedPersonasRaw(), {
-      defaultCapabilities: this.getDefaultCapabilities(),
-    });
+    const diagnostics = this.getAgentDiagnostics();
+    return new Map(diagnostics.workspaceAgents.map((agent) => [normalizeAgentAlias(agent.alias), agent]));
   }
 
   getAgentsArray() {
-    return Array
-      .from(this.getConfiguredAgents().values())
-      .sort((left, right) => left.alias.localeCompare(right.alias));
+    return this.getAgentDiagnostics().workspaceAgents;
   }
 
   async updateWorkspacePersonas(rawPersonas) {
@@ -152,6 +173,14 @@ class SettingsService {
     const personas = this.getWorkspaceScopedPersonasRaw();
     const next = personas.filter((entry) => normalizeAgentAlias(entry && entry.alias) !== targetAlias);
     await this.updateWorkspacePersonas(next);
+  }
+
+  async clearUserLevelAgents() {
+    const primaryConfig = this.workspace.getConfiguration('seamlessAiBridge');
+    await primaryConfig.update('personas', undefined, vscode.ConfigurationTarget.Global);
+
+    const legacyConfig = this.workspace.getConfiguration('seamless-ai-bridge');
+    await legacyConfig.update('personas', undefined, vscode.ConfigurationTarget.Global);
   }
 }
 

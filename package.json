@@ -73,6 +73,18 @@
       {
         "command": "seamlessAiBridge.refreshAgents",
         "title": "Seamless AI Bridge: Refresh Agents"
+      },
+      {
+        "command": "seamlessAiBridge.showGlobalAgentDiagnostics",
+        "title": "Seamless AI Bridge: Show Global Agent Diagnostics"
+      },
+      {
+        "command": "seamlessAiBridge.openUserSettingsJson",
+        "title": "Seamless AI Bridge: Open User Settings (JSON)"
+      },
+      {
+        "command": "seamlessAiBridge.clearUserLevelAgents",
+        "title": "Seamless AI Bridge: Clear User-Level Agents"
       }
     ],
     "menus": {
@@ -122,7 +134,7 @@
         "seamlessAiBridge.personas": {
           "type": "array",
           "scope": "resource",
-          "markdownDescription": "Configurable agents for @bridge. Each agent can be addressed as `@<alias>` and defines provider, model, capabilities, and history behavior.",
+          "markdownDescription": "Defines workspace-specific agents. User-level values for this setting are ignored by the extension at runtime and should be migrated.",
           "default": [],
           "items": {
             "type": "object",
