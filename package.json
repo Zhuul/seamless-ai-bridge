@@ -73,18 +73,6 @@
       {
         "command": "seamlessAiBridge.refreshAgents",
         "title": "Seamless AI Bridge: Refresh Agents"
-      },
-      {
-        "command": "seamlessAiBridge.showGlobalAgentDiagnostics",
-        "title": "Seamless AI Bridge: Show Global Agent Diagnostics"
-      },
-      {
-        "command": "seamlessAiBridge.openUserSettingsJson",
-        "title": "Seamless AI Bridge: Open User Settings (JSON)"
-      },
-      {
-        "command": "seamlessAiBridge.clearUserLevelAgents",
-        "title": "Seamless AI Bridge: Clear User-Level Agents"
       }
     ],
     "menus": {
@@ -220,9 +208,9 @@
           "description": "Allow legacy text command `@bridge @alias /reset`. When false, users must reset via the Agent Manager UI.",
           "default": false
         },
-        "seamless-ai-bridge.debug.enabled": {
+        "seamlessAiBridge.developer.enableWipeCommand": {
           "type": "boolean",
-          "description": "Enable detailed debug logging to the Seamless AI Bridge output channel.",
+          "description": "Enable the destructive `@bridge /wipe` developer command that clears user/workspace agent settings and cached histories.",
           "default": false
         },
         "seamlessAiBridge.debug.enabled": {

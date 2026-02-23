@@ -854,9 +854,7 @@ function activate(extensionContext) {
   }
 
   function debugLog(payload) {
-    const debugEnabledLegacy = Boolean(vscode.workspace.getConfiguration('seamless-ai-bridge').get('debug.enabled', false));
-    const debugEnabledV4 = Boolean(vscode.workspace.getConfiguration('seamlessAiBridge').get('debug.enabled', false));
-    const debugEnabled = debugEnabledLegacy || debugEnabledV4;
+    const debugEnabled = Boolean(vscode.workspace.getConfiguration('seamlessAiBridge').get('debug.enabled', false));
     if (!debugEnabled) return;
     if (typeof payload === 'string') {
       log(`[debug] ${payload}`);
@@ -1049,32 +1047,26 @@ function activate(extensionContext) {
   let refreshInFlight;
   let registryReady = false;
   let lastExperimentalMode;
-  let cachedAgentDiagnostics = {
+  let cachedAgentState = {
     workspaceAgents: [],
-    globalAgents: [],
-    globalOnlyAliases: [],
-    legacyGlobalAgents: [],
+    userAgents: [],
+    knownAliases: [],
   };
 
-  function recomputeAgentDiagnostics(reason) {
-    cachedAgentDiagnostics = settingsService.getAgentDiagnostics();
+  function recomputeAgentState(reason) {
+    cachedAgentState = settingsService.getAgentSources();
     debugLog({
-      type: 'agent-diagnostics-refresh',
+      type: 'agent-state-refresh',
       reason,
-      workspaceAgents: cachedAgentDiagnostics.workspaceAgents.map((agent) => agent.alias),
-      globalAgents: cachedAgentDiagnostics.globalAgents.map((agent) => agent.alias),
-      globalOnlyAliases: cachedAgentDiagnostics.globalOnlyAliases,
-      legacyGlobalAgents: cachedAgentDiagnostics.legacyGlobalAgents.map((agent) => agent.alias),
+      workspaceAgents: cachedAgentState.workspaceAgents.map((agent) => agent.alias),
+      userAgents: cachedAgentState.userAgents.map((agent) => agent.alias),
+      knownAliases: cachedAgentState.knownAliases,
     });
-    return cachedAgentDiagnostics;
+    return cachedAgentState;
   }
 
-  function getCachedAgentDiagnostics() {
-    return cachedAgentDiagnostics;
-  }
-
-  function getGlobalOnlyAliasSet() {
-    return new Set((cachedAgentDiagnostics.globalOnlyAliases || []).map((alias) => normalizeAgentAlias(alias)));
+  function getCachedAgentState() {
+    return cachedAgentState;
   }
 
   async function refreshParticipantRegistry(reason) {
@@ -1293,11 +1285,11 @@ function activate(extensionContext) {
   }
 
   function getAgentsMap() {
-    return new Map((cachedAgentDiagnostics.workspaceAgents || []).map((agent) => [normalizeAgentAlias(agent.alias), agent]));
+    return new Map((cachedAgentState.workspaceAgents || []).map((agent) => [normalizeAgentAlias(agent.alias), agent]));
   }
 
   function getAgentsArray() {
-    return cachedAgentDiagnostics.workspaceAgents || [];
+    return cachedAgentState.workspaceAgents || [];
   }
 
   async function saveAgent(agentInput) {
@@ -1526,7 +1518,7 @@ function activate(extensionContext) {
   ]);
 
   log('Activating Seamless AI Bridge.');
-  recomputeAgentDiagnostics('activate');
+  recomputeAgentState('activate');
   refreshParticipantRegistry('activate').catch((error) => {
     const message = error && error.message ? error.message : String(error);
     log(`Initial participant refresh failed: ${message}`);
@@ -1534,7 +1526,7 @@ function activate(extensionContext) {
 
   agentTreeProvider = new AgentTreeProvider({
     hasWorkspaceOpen: () => settingsService.hasWorkspaceOpen(),
-    getAgentDiagnostics: () => getCachedAgentDiagnostics(),
+    getAgents: () => getAgentsArray(),
   });
   extensionContext.subscriptions.push(
     vscode.window.registerTreeDataProvider('seamlessAiBridge.agentsView', agentTreeProvider),
@@ -1543,16 +1535,15 @@ function activate(extensionContext) {
   agentManagerViewProvider = new AgentManagerViewProvider({
     getAgents: () => getAgentsArray(),
     getDefaultCapabilities: () => getDefaultCapabilities(),
-    getDiagnostics: () => getCachedAgentDiagnostics(),
     listModels: (providerId, token) => listProviderModels(providerId, token),
     saveAgent: async (agent) => {
       await saveAgent(agent);
-      recomputeAgentDiagnostics('save-agent');
+      recomputeAgentState('save-agent');
       refreshAgentViews();
     },
     deleteAgent: async (alias) => {
       await deleteAgent(alias);
-      recomputeAgentDiagnostics('delete-agent');
+      recomputeAgentState('delete-agent');
       refreshAgentViews();
     },
     resetAgentHistory: async (alias) => {
@@ -1652,6 +1643,32 @@ function activate(extensionContext) {
     };
   }
 
+  async function runWipeCommand(response) {
+    const enableWipe = Boolean(vscode.workspace.getConfiguration('seamlessAiBridge').get('developer.enableWipeCommand', false));
+    if (!enableWipe) {
+      response.markdown('`@bridge /wipe` is disabled. Enable `seamlessAiBridge.developer.enableWipeCommand` to use it.');
+      return;
+    }
+
+    const stateBefore = getCachedAgentState();
+    const aliasesToClear = Array.isArray(stateBefore.knownAliases)
+      ? stateBefore.knownAliases
+      : settingsService.getKnownAliases();
+
+    for (const alias of aliasesToClear) {
+      await agentSessionManager.clearAgent(alias);
+    }
+
+    await settingsService.wipeAllAgentsAndSettings();
+    const stateAfter = recomputeAgentState('wipe-command');
+    refreshAgentViews();
+
+    response.markdown('Wipe complete.');
+    response.markdown(`Cleared aliases: ${aliasesToClear.length}`);
+    response.markdown(`Workspace agents remaining: ${stateAfter.workspaceAgents.length}`);
+    response.markdown(`User agents remaining: ${stateAfter.userAgents.length}`);
+  }
+
   extensionContext.subscriptions.push(
     vscode.commands.registerCommand('seamlessAiBridge.refreshAgents', () => {
       refreshAgentViews();
@@ -1664,7 +1681,7 @@ function activate(extensionContext) {
       const next = await promptAgentFields();
       if (!next) return;
       await saveAgent(next);
-      recomputeAgentDiagnostics('add-agent-command');
+      recomputeAgentState('add-agent-command');
       refreshAgentViews();
     }),
     vscode.commands.registerCommand('seamlessAiBridge.editAgent', async (item) => {
@@ -1682,7 +1699,7 @@ function activate(extensionContext) {
         await deleteAgent(alias);
       }
       await saveAgent(next);
-      recomputeAgentDiagnostics('edit-agent-command');
+      recomputeAgentState('edit-agent-command');
       refreshAgentViews();
     }),
     vscode.commands.registerCommand('seamlessAiBridge.removeAgent', async (item) => {
@@ -1691,7 +1708,7 @@ function activate(extensionContext) {
       if (!alias) return;
       await deleteAgent(alias);
       await resetAgentHistory(alias);
-      recomputeAgentDiagnostics('remove-agent-command');
+      recomputeAgentState('remove-agent-command');
       refreshAgentViews();
     }),
     vscode.commands.registerCommand('seamlessAiBridge.resetAgentHistory', async (item) => {
@@ -1702,56 +1719,21 @@ function activate(extensionContext) {
       refreshAgentViews();
       vscode.window.showInformationMessage(`Reset history for @${alias}.`);
     }),
-    vscode.commands.registerCommand('seamlessAiBridge.showGlobalAgentDiagnostics', () => {
-      const diagnostics = recomputeAgentDiagnostics('show-global-diagnostics-command');
-      const workspaceAliases = diagnostics.workspaceAgents.map((agent) => `@${agent.alias}`);
-      const globalAliases = diagnostics.globalAgents.map((agent) => `@${agent.alias}`);
-      const globalOnlyAliases = diagnostics.globalOnlyAliases.map((alias) => `@${alias}`);
-      const legacyAliases = diagnostics.legacyGlobalAgents.map((agent) => `@${agent.alias}`);
-
-      log('Global Agent Diagnostics');
-      log(`  Workspace aliases: ${workspaceAliases.length ? workspaceAliases.join(', ') : '(none)'}`);
-      log(`  User aliases: ${globalAliases.length ? globalAliases.join(', ') : '(none)'}`);
-      log(`  Global-only aliases: ${globalOnlyAliases.length ? globalOnlyAliases.join(', ') : '(none)'}`);
-      log(`  Legacy key aliases (seamless-ai-bridge.personas): ${legacyAliases.length ? legacyAliases.join(', ') : '(none)'}`);
-
-      output.show(true);
-      vscode.window.showInformationMessage('Seamless AI Bridge diagnostics written to output channel.');
-    }),
-    vscode.commands.registerCommand('seamlessAiBridge.openUserSettingsJson', async () => {
-      await vscode.commands.executeCommand('workbench.action.openSettingsJson');
-    }),
-    vscode.commands.registerCommand('seamlessAiBridge.clearUserLevelAgents', async () => {
-      const choice = await vscode.window.showWarningMessage(
-        'Clear all User-level Seamless AI Bridge agents (including legacy key) from settings.json?',
-        { modal: true },
-        'Clear User-Level Agents',
-      );
-
-      if (choice !== 'Clear User-Level Agents') {
-        return;
-      }
-
-      await settingsService.clearUserLevelAgents();
-      recomputeAgentDiagnostics('clear-user-level-agents-command');
-      refreshAgentViews();
-      vscode.window.showInformationMessage('Cleared User-level Seamless AI Bridge agents.');
-    }),
   );
 
   extensionContext.subscriptions.push(vscode.workspace.onDidChangeConfiguration((event) => {
     if (
       event.affectsConfiguration('seamlessAiBridge.personas')
       || event.affectsConfiguration('seamlessAiBridge.defaultCapabilities')
-      || event.affectsConfiguration('seamless-ai-bridge.personas')
+      || event.affectsConfiguration('seamlessAiBridge.developer.enableWipeCommand')
     ) {
-      recomputeAgentDiagnostics('configuration-change');
+      recomputeAgentState('configuration-change');
       refreshAgentViews();
     }
   }));
 
   extensionContext.subscriptions.push(vscode.workspace.onDidChangeWorkspaceFolders(() => {
-    recomputeAgentDiagnostics('workspace-folders-change');
+    recomputeAgentState('workspace-folders-change');
     refreshAgentViews();
   }));
 
@@ -1812,15 +1794,18 @@ function activate(extensionContext) {
         return;
       }
 
+      if (prompt === '/wipe') {
+        phase = 'wipe-command';
+        await runWipeCommand(response);
+        return;
+      }
+
       phase = 'load-config';
       const bridgeConfig = vscode.workspace.getConfiguration('seamlessAiBridge');
       const isExperimentalMode = Boolean(bridgeConfig.get('experimental.enableCrossParticipantChat', false));
       const defaultCapabilities = getDefaultCapabilities();
       const configuredAgents = getAgentsMap();
       const agentRoute = parseAgentPrompt(prompt, configuredAgents);
-      const promptTargetMatch = /^@([A-Za-z0-9._-]+)/.exec(prompt);
-      const promptTargetAlias = promptTargetMatch ? normalizeAgentAlias(promptTargetMatch[1]) : '';
-      const globalOnlyAliasSet = getGlobalOnlyAliasSet();
 
       debugLog({
         type: 'provide-response-trace',
@@ -1830,18 +1815,7 @@ function activate(extensionContext) {
         registryReady,
         configuredAgents: configuredAgents.size,
         agentAlias: agentRoute.agent ? agentRoute.agent.alias : '',
-        globalOnlyAliases: Array.from(globalOnlyAliasSet),
       });
-
-      if (!agentRoute.agent && promptTargetAlias && globalOnlyAliasSet.has(promptTargetAlias)) {
-        response.markdown(`@${promptTargetAlias} exists only in your User settings and is ignored. Move it to workspace .vscode/settings.json to use it.`);
-        debugLog({
-          type: 'agent-ghost-alias-blocked',
-          requestId,
-          alias: promptTargetAlias,
-        });
-        return;
-      }
 
       if (agentRoute.agent) {
         const agent = agentRoute.agent;

@@ -23,35 +23,16 @@ class AgentMessageItem extends vscode.TreeItem {
   }
 }
 
-class AgentWarningItem extends vscode.TreeItem {
-  constructor(aliases) {
-    const list = Array.isArray(aliases) ? aliases.filter(Boolean) : [];
-    const label = list.length === 1
-      ? `⚠️ Global agent ignored: @${list[0]}`
-      : `⚠️ Global agents ignored: ${list.map((alias) => `@${alias}`).join(', ')}`;
-
-    super(label, vscode.TreeItemCollapsibleState.None);
-    this.contextValue = 'seamlessAiBridge.agentWarning';
-    this.tooltip = new vscode.MarkdownString([
-      '**User-level agent settings are ignored.**',
-      '',
-      `Detected aliases: ${list.map((alias) => `@${alias}`).join(', ')}`,
-      '',
-      'Move these definitions into workspace `.vscode/settings.json`.',
-    ].join('\n'));
-  }
-}
-
 class AgentTreeProvider {
   constructor(options) {
-    if (options && typeof options.getAgentDiagnostics === 'function') {
-      this.getAgentDiagnostics = options.getAgentDiagnostics;
+    if (options && typeof options.getAgents === 'function') {
+      this.getAgents = options.getAgents;
       this.hasWorkspaceOpen = typeof options.hasWorkspaceOpen === 'function'
         ? options.hasWorkspaceOpen
         : (() => true);
     } else {
       const settingsService = options;
-      this.getAgentDiagnostics = () => settingsService.getAgentDiagnostics();
+      this.getAgents = () => settingsService.getAgentsArray();
       this.hasWorkspaceOpen = () => settingsService.hasWorkspaceOpen();
     }
     this._onDidChangeTreeData = new vscode.EventEmitter();
@@ -71,21 +52,13 @@ class AgentTreeProvider {
       return [new AgentMessageItem('No workspace open. Agents are configured per-workspace.')];
     }
 
-    const diagnostics = this.getAgentDiagnostics();
-    const agents = diagnostics.workspaceAgents;
-    const rows = [];
-
-    if (Array.isArray(diagnostics.globalOnlyAliases) && diagnostics.globalOnlyAliases.length > 0) {
-      rows.push(new AgentWarningItem(diagnostics.globalOnlyAliases));
-    }
+    const agents = this.getAgents();
 
     if (agents.length === 0) {
-      rows.push(new AgentMessageItem('No agents configured in this workspace.'));
-      return rows;
+      return [new AgentMessageItem('No agents configured in this workspace.')];
     }
 
-    rows.push(...agents.map((agent) => new AgentTreeItem(agent)));
-    return rows;
+    return agents.map((agent) => new AgentTreeItem(agent));
   }
 }
 
@@ -93,5 +66,4 @@ module.exports = {
   AgentTreeProvider,
   AgentTreeItem,
   AgentMessageItem,
-  AgentWarningItem,
 };

@@ -10,7 +10,6 @@ class AgentManagerViewProvider {
       type: 'state',
       agents: this.options.getAgents(),
       defaultCapabilities: this.options.getDefaultCapabilities(),
-      diagnostics: this.options.getDiagnostics ? this.options.getDiagnostics() : undefined,
     });
   }
 
@@ -80,12 +79,10 @@ class AgentManagerViewProvider {
     .setting-desc { opacity: 0.85; font-size: 12px; margin-bottom: 6px; }
     .toggle-inline { display: flex; align-items: center; gap: 8px; margin: 0; }
     .toggle-inline input { width: auto; margin: 0; }
-    .banner { border: 1px solid var(--vscode-editorWarning-foreground); border-radius: 4px; padding: 8px; margin-bottom: 10px; color: var(--vscode-editorWarning-foreground); display: none; }
     .actions { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 6px; margin-top: 8px; }
   </style>
 </head>
 <body>
-  <div class="banner" id="globalWarning"></div>
   <div class="agent-list" id="agentList"></div>
 
   <div class="row">
@@ -130,7 +127,7 @@ class AgentManagerViewProvider {
 
   <script>
     const vscode = acquireVsCodeApi();
-    let state = { agents: [], defaultCapabilities: [], diagnostics: {} };
+    let state = { agents: [], defaultCapabilities: [] };
     let currentAlias = '';
 
     const alias = document.getElementById('alias');
@@ -140,7 +137,6 @@ class AgentManagerViewProvider {
     const capPanel = document.getElementById('capPanel');
     const historyPersistence = document.getElementById('historyPersistence');
     const terminalWarn = document.getElementById('terminalWarn');
-    const globalWarning = document.getElementById('globalWarning');
 
     function selectedCapabilities() {
       return Array.from(capPanel.querySelectorAll('input[type="checkbox"]'))
@@ -158,21 +154,6 @@ class AgentManagerViewProvider {
         btn.onclick = () => selectAgent(agent.alias);
         container.appendChild(btn);
       }
-    }
-
-    function renderDiagnostics() {
-      const aliases = state && state.diagnostics && Array.isArray(state.diagnostics.globalOnlyAliases)
-        ? state.diagnostics.globalOnlyAliases
-        : [];
-
-      if (aliases.length === 0) {
-        globalWarning.style.display = 'none';
-        globalWarning.textContent = '';
-        return;
-      }
-
-      globalWarning.style.display = 'block';
-      globalWarning.textContent = 'User-level agents are ignored at runtime: ' + aliases.map((alias) => '@' + alias).join(', ') + '. Move them to workspace settings.';
     }
 
     function refreshTerminalWarning() {
@@ -280,10 +261,8 @@ class AgentManagerViewProvider {
         state = {
           agents: Array.isArray(message.agents) ? message.agents : [],
           defaultCapabilities: Array.isArray(message.defaultCapabilities) ? message.defaultCapabilities : [],
-          diagnostics: message.diagnostics && typeof message.diagnostics === 'object' ? message.diagnostics : {},
         };
         renderAgents();
-        renderDiagnostics();
         if (currentAlias) {
           selectAgent(currentAlias);
         }
