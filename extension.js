@@ -15,6 +15,7 @@ const { CopilotProvider } = require('./providers/copilotProvider');
 const { CodexProvider } = require('./providers/codexProvider');
 const { AgentTreeProvider } = require('./agentTreeProvider');
 const { AgentManagerViewProvider } = require('./agentManagerViewProvider');
+const { SettingsService } = require('./settingsService');
 
 const BLACKLIST_TOKENS = new Set(['test', 'debug', 'internal', 'sample']);
 const CORE_CHAT_TOKENS = new Set(['copilot', 'codex']);
@@ -864,6 +865,8 @@ function activate(extensionContext) {
     log(`[debug] ${JSON.stringify(payload)}`);
   }
 
+  const settingsService = new SettingsService(vscode.workspace);
+
   function serializeError(error) {
     if (!error || typeof error !== 'object') {
       return {
@@ -1259,77 +1262,23 @@ function activate(extensionContext) {
   }
 
   function getDefaultCapabilities() {
-    const bridgeConfig = vscode.workspace.getConfiguration('seamlessAiBridge');
-    const configured = bridgeConfig.get('defaultCapabilities', ['@workspace']);
-    return Array.isArray(configured)
-      ? configured.filter((entry) => typeof entry === 'string' && entry.trim()).map((entry) => entry.trim())
-      : ['@workspace'];
+    return settingsService.getDefaultCapabilities();
   }
 
   function getAgentsMap() {
-    const bridgeConfig = vscode.workspace.getConfiguration('seamlessAiBridge');
-    return readConfiguredAgents(bridgeConfig.get('personas', []), {
-      defaultCapabilities: getDefaultCapabilities(),
-    });
+    return settingsService.getConfiguredAgents();
   }
 
   function getAgentsArray() {
-    return Array.from(getAgentsMap().values()).sort((left, right) => left.alias.localeCompare(right.alias));
+    return settingsService.getAgentsArray();
   }
 
   async function saveAgent(agentInput) {
-    const bridgeConfig = vscode.workspace.getConfiguration('seamlessAiBridge');
-    const current = bridgeConfig.get('personas', []);
-    const personas = Array.isArray(current) ? [...current] : [];
-
-    const alias = normalizeAgentAlias(agentInput && agentInput.alias);
-    if (!alias) {
-      throw new Error('Agent alias is required.');
-    }
-
-    const provider = typeof (agentInput && agentInput.provider) === 'string' && agentInput.provider.trim()
-      ? agentInput.provider.trim().toLowerCase()
-      : 'copilot';
-    const model = typeof (agentInput && agentInput.model) === 'string' ? agentInput.model.trim() : '';
-    const historyPersistence = Boolean(agentInput ? agentInput.historyPersistence !== false : true);
-    const capabilities = Array.isArray(agentInput && agentInput.capabilities)
-      ? Array.from(new Set(agentInput.capabilities.filter((entry) => typeof entry === 'string' && entry.trim()).map((entry) => entry.trim())))
-      : 'default';
-
-    const nextAgent = {
-      alias,
-      provider,
-      historyPersistence,
-      capabilities,
-      enabled: true,
-    };
-
-    if (model) {
-      nextAgent.model = model;
-    }
-
-    const index = personas.findIndex((entry) => normalizeAgentAlias(entry && entry.alias) === alias);
-    if (index >= 0) {
-      personas[index] = {
-        ...personas[index],
-        ...nextAgent,
-      };
-    } else {
-      personas.push(nextAgent);
-    }
-
-    await bridgeConfig.update('personas', personas, vscode.ConfigurationTarget.Global);
+    await settingsService.upsertAgent(agentInput);
   }
 
   async function deleteAgent(alias) {
-    const targetAlias = normalizeAgentAlias(alias);
-    if (!targetAlias) return;
-
-    const bridgeConfig = vscode.workspace.getConfiguration('seamlessAiBridge');
-    const current = bridgeConfig.get('personas', []);
-    const personas = Array.isArray(current) ? current : [];
-    const next = personas.filter((entry) => normalizeAgentAlias(entry && entry.alias) !== targetAlias);
-    await bridgeConfig.update('personas', next, vscode.ConfigurationTarget.Global);
+    await settingsService.removeAgent(alias);
   }
 
   async function resetAgentHistory(alias) {
@@ -1555,7 +1504,7 @@ function activate(extensionContext) {
     log(`Initial participant refresh failed: ${message}`);
   });
 
-  agentTreeProvider = new AgentTreeProvider(() => getAgentsArray());
+  agentTreeProvider = new AgentTreeProvider(settingsService);
   extensionContext.subscriptions.push(
     vscode.window.registerTreeDataProvider('seamlessAiBridge.agentsView', agentTreeProvider),
   );
@@ -1583,6 +1532,11 @@ function activate(extensionContext) {
   );
 
   async function pickAgentAlias(placeHolder) {
+    if (!settingsService.hasWorkspaceOpen()) {
+      vscode.window.showInformationMessage('No workspace open. Agents are configured per-workspace.');
+      return '';
+    }
+
     const agents = getAgentsArray();
     if (agents.length === 0) {
       vscode.window.showInformationMessage('No agents configured.');
@@ -1669,6 +1623,10 @@ function activate(extensionContext) {
       refreshAgentViews();
     }),
     vscode.commands.registerCommand('seamlessAiBridge.addAgent', async () => {
+      if (!settingsService.hasWorkspaceOpen()) {
+        vscode.window.showInformationMessage('No workspace open. Agents are configured per-workspace.');
+        return;
+      }
       const next = await promptAgentFields();
       if (!next) return;
       await saveAgent(next);
@@ -1716,6 +1674,10 @@ function activate(extensionContext) {
     ) {
       refreshAgentViews();
     }
+  }));
+
+  extensionContext.subscriptions.push(vscode.workspace.onDidChangeWorkspaceFolders(() => {
+    refreshAgentViews();
   }));
 
   async function handleRequest(request, _chatContext, response, token) {
@@ -1779,7 +1741,7 @@ function activate(extensionContext) {
       const bridgeConfig = vscode.workspace.getConfiguration('seamlessAiBridge');
       const isExperimentalMode = Boolean(bridgeConfig.get('experimental.enableCrossParticipantChat', false));
       const defaultCapabilities = getDefaultCapabilities();
-      const configuredAgents = readConfiguredAgents(bridgeConfig.get('personas', []), { defaultCapabilities });
+      const configuredAgents = getAgentsMap();
       const agentRoute = parseAgentPrompt(prompt, configuredAgents);
 
       debugLog({

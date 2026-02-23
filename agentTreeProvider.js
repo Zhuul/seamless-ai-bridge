@@ -16,9 +16,16 @@ class AgentTreeItem extends vscode.TreeItem {
   }
 }
 
+class AgentMessageItem extends vscode.TreeItem {
+  constructor(message) {
+    super(message, vscode.TreeItemCollapsibleState.None);
+    this.contextValue = 'seamlessAiBridge.agentMessage';
+  }
+}
+
 class AgentTreeProvider {
-  constructor(getAgents) {
-    this.getAgents = getAgents;
+  constructor(settingsService) {
+    this.settingsService = settingsService;
     this._onDidChangeTreeData = new vscode.EventEmitter();
     this.onDidChangeTreeData = this._onDidChangeTreeData.event;
   }
@@ -32,7 +39,15 @@ class AgentTreeProvider {
   }
 
   getChildren() {
-    const agents = this.getAgents();
+    if (!this.settingsService || !this.settingsService.hasWorkspaceOpen()) {
+      return [new AgentMessageItem('No workspace open. Agents are configured per-workspace.')];
+    }
+
+    const agents = this.settingsService.getAgentsArray();
+    if (agents.length === 0) {
+      return [new AgentMessageItem('No agents configured in this workspace.')];
+    }
+
     return agents.map((agent) => new AgentTreeItem(agent));
   }
 }
@@ -40,4 +55,5 @@ class AgentTreeProvider {
 module.exports = {
   AgentTreeProvider,
   AgentTreeItem,
+  AgentMessageItem,
 };
