@@ -867,6 +867,19 @@ function activate(extensionContext) {
 
   const settingsService = new SettingsService(vscode.workspace);
 
+  async function enforceWorkspaceOnlyPersonasSetting() {
+    try {
+      const removedGlobal = await settingsService.clearGlobalPersonasValueIfPresent();
+      if (removedGlobal) {
+        log('Removed global seamlessAiBridge.personas value to enforce workspace-only configuration.');
+        vscode.window.showWarningMessage('Removed User-level Seamless AI Bridge personas. Agents are workspace-scoped; configure them in .vscode/settings.json.');
+      }
+    } catch (error) {
+      const message = error && error.message ? error.message : String(error);
+      log(`Failed to enforce workspace-only personas setting: ${message}`);
+    }
+  }
+
   function serializeError(error) {
     if (!error || typeof error !== 'object') {
       return {
@@ -1499,6 +1512,7 @@ function activate(extensionContext) {
   ]);
 
   log('Activating Seamless AI Bridge.');
+  enforceWorkspaceOnlyPersonasSetting();
   refreshParticipantRegistry('activate').catch((error) => {
     const message = error && error.message ? error.message : String(error);
     log(`Initial participant refresh failed: ${message}`);
@@ -1672,6 +1686,9 @@ function activate(extensionContext) {
       event.affectsConfiguration('seamlessAiBridge.personas')
       || event.affectsConfiguration('seamlessAiBridge.defaultCapabilities')
     ) {
+      if (event.affectsConfiguration('seamlessAiBridge.personas')) {
+        enforceWorkspaceOnlyPersonasSetting();
+      }
       refreshAgentViews();
     }
   }));

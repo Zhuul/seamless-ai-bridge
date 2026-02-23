@@ -53,6 +53,25 @@ class SettingsService {
     return [...fromFolders, ...workspaceValue];
   }
 
+  hasGlobalPersonasValue() {
+    const inspect = this.workspace.getConfiguration('seamlessAiBridge').inspect('personas');
+    if (!inspect) return false;
+    if (Array.isArray(inspect.globalValue)) {
+      return inspect.globalValue.length > 0;
+    }
+    return inspect.globalValue !== undefined;
+  }
+
+  async clearGlobalPersonasValueIfPresent() {
+    if (!this.hasGlobalPersonasValue()) {
+      return false;
+    }
+
+    const bridgeConfig = this.workspace.getConfiguration('seamlessAiBridge');
+    await bridgeConfig.update('personas', undefined, vscode.ConfigurationTarget.Global);
+    return true;
+  }
+
   getConfiguredAgents() {
     return readConfiguredAgents(this.getWorkspaceScopedPersonasRaw(), {
       defaultCapabilities: this.getDefaultCapabilities(),
